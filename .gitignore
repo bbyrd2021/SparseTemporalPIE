@@ -1,0 +1,30 @@
+# Model weights — share via GitHub Releases or HuggingFace
+*.pth
+*.pt
+weights_*/
+pre_train_weights/
+weights_sparse/
+
+# Training artifacts
+runs/
+training_logs/
+training_logs_sparse/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Generated at runtime
+change_detector_config.json
