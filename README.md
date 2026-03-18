@@ -1,7 +1,7 @@
 # SparseTemporalPIE
 
 > Fork of [EfficientPIE](https://github.com/heinideyibadiaole/EfficientPIE) (IJCAI-25)
-> Extended with temporal cross-attention keyframe selection via ViTPose.
+> Extended with embedding-distance keyframe selection and normalized pose features.
 > Authors: Brandon Byrd, Abel Abebe Bzuayene — xDI Lab, NC A&T State University
 
 ---
@@ -13,27 +13,43 @@ using an EfficientNet-inspired backbone (no RNN). It achieves state-of-the-art a
 at 0.69M parameters and sub-millisecond inference.
 
 **SparseTemporalPIE** extends EfficientPIE with a temporal mechanism:
-- A ViTPose-based ChangeDetector selects the last behaviorally-salient keyframe (f*)
-  from the 15-frame observation window using head orientation, body lean, and gaze signals
-- f_current and f* are encoded by a shared frozen EfficientPIE backbone
-- A cross-attention module with a hard gate fuses the two embeddings
-- The absence flag explicitly signals when no behavioral change was detected
+- A salient reference frame (f\*) is selected from the observation window as the frame
+  with maximum cosine distance from f\_current in the frozen backbone embedding space
+- f\_current and f\* are encoded by a shared frozen EfficientPIE backbone
+- Cross-attention fuses the two embeddings (f\_current queries, f\* keys/values)
+- Normalized ViTPose keypoints for f\_current are concatenated to the classifier input,
+  providing explicit body-pose signal alongside the temporal attention context
 
 Architecture:
 
 ```
-frozen backbone(f_current) ──► embed_current (1280)
-frozen backbone(f*)        ──► embed_fstar   (1280)
-                                      │
-                     CrossAttention(Q=embed_current, K/V=embed_fstar)
-                                      │
-                       hard gate: attn_out × (1 − absence_flag)
-                                      │
-                       residual + LayerNorm + FeedForward
-                                      │
-                       concat([enriched, absence_flag])  →  1281-d
-                                      │
-                       Classifier (1281 → 256 → 2)  →  crossing probability
+                    ┌─ frozen backbone ──► embed_current (1280)
+f_current (300×300) ┤
+                    └─ (also for f* selection via cosine distance)
+
+f* = argmax cosine_distance(embed_current, embed_t) for t in [0, step-1]
+     (computed in SparseDataset using a CPU copy of the backbone)
+
+f*       (300×300) ──► frozen backbone ──► embed_fstar (1280)
+
+CrossAttention(Q=embed_current, K=embed_fstar, V=embed_fstar)
+    │
+    attn_out (1280)
+    │
+residual: embed_current + attn_out  → LayerNorm
+    │
+FeedForward: 1280 → 512 → 1280  → LayerNorm
+    │
+    enriched (1280)
+
+pose_feats (34) ← normalize_pose(keypoints[step], bbox)
+                  17 joints × (norm_x, norm_y); low-conf joints zeroed
+
+concat([enriched, pose_feats])  →  1314-d
+    │
+Classifier: Linear(1314→256) → ReLU → Dropout → Linear(256→2)
+    │
+crossing probability
 ```
 
 ---
@@ -47,7 +63,7 @@ frozen backbone(f*)        ──► embed_fstar   (1280)
 | F1        | TBD               | 0.952                     | 0.95            |
 | Precision | TBD               | 0.961                     | 0.96            |
 
-See [`docs/REPLICATION_RESULTS.md`](docs/REPLICATION_RESULTS.md) for full evaluation details.
+See [`docs/REPLICATION_RESULTS.md`](docs/REPLICATION_RESULTS.md) for full EfficientPIE details.
 
 ---
 
@@ -55,32 +71,32 @@ See [`docs/REPLICATION_RESULTS.md`](docs/REPLICATION_RESULTS.md) for full evalua
 
 ```
 models/
-  EfficientPIE.py                 # baseline model
+  EfficientPIE.py                 # baseline model (unchanged)
   SparseTemporalPIE.py            # temporal cross-attention model
 
 utils/
   pie_data.py / jaad_data.py      # dataset APIs
   my_dataset.py                   # EfficientPIE dataset loader
-  sparse_dataset.py               # SparseTemporalPIE dataset loader
-  change_detector.py              # ViTPose-based keyframe selector
-  train_val.py                    # training/eval loops
+  sparse_dataset.py               # SparseTemporalPIE dataset (f_current, f*, pose_feats)
+  change_detector.py              # ViTPose ChangeDetector (retained for ablation)
+  train_val.py                    # training/eval loops (EfficientPIE + SparseTemporalPIE)
 
 train_EfficientPIE.py             # EfficientPIE base training
 pie_domain_incremental_learning.py # IL steps 2→14
 test_EfficientPIE.py              # EfficientPIE evaluation
 
-train_SparseTemporalPIE.py        # SparseTemporalPIE base training
-pie_sparse_incremental_learning.py # SparseTemporalPIE IL steps
+train_SparseTemporalPIE.py        # SparseTemporalPIE base training (step 0)
+pie_sparse_incremental_learning.py # SparseTemporalPIE IL steps 2→14
 test_SparseTemporalPIE.py         # evaluation + v=0 subset metrics
 
 extract_frames.py                 # video → image frames (run once)
 extract_keypoints.py              # ViTPose keypoint extraction (run once)
-calibrate_change_detector.py      # threshold calibration (run once)
+calibrate_change_detector.py      # ablation tool — not used in main pipeline
 
 run_sparse_pie_pipeline.sh        # full SparseTemporalPIE pipeline
 run_pie_pipeline.sh               # full EfficientPIE pipeline
 
-docs/                             # design docs, session notes, paper PDF
+docs/                             # design docs and session notes
 ```
 
 ---
@@ -119,7 +135,7 @@ done
 # 1. Extract frames (one-time)
 python extract_frames.py --dataset pie --data-path /data/datasets/PIE
 
-# 2. Base training (step 0)
+# 2. Base training
 python train_EfficientPIE.py --step 0 --epochs 50 --batch_size 32 \
     --weights pre_train_weights/min_loss_pretrained_model_imagenet.pth
 
@@ -136,11 +152,9 @@ python test_EfficientPIE.py --weights weights_v8/best_model_PIE_IL_step14_new.pt
 # Prerequisites (one-time)
 python extract_frames.py --dataset pie --data-path /data/datasets/PIE
 python extract_keypoints.py --dataset pie --data-path /data/datasets/PIE \
-    --output-dir /data/datasets/PIE/keypoints
-python calibrate_change_detector.py --data-path /data/datasets/PIE \
-    --keypoints-dir /data/datasets/PIE/keypoints
+    --output-dir /data/datasets/PIE/keypoints_pid
 
-# Full pipeline
+# Full pipeline (step 0 + IL steps 2–14 + eval)
 bash run_sparse_pie_pipeline.sh
 ```
 
@@ -150,8 +164,9 @@ bash run_sparse_pie_pipeline.sh
 
 - [`docs/SPARSE_TEMPORAL_PIE.md`](docs/SPARSE_TEMPORAL_PIE.md) — full architecture and implementation guide
 - [`docs/REPLICATION_RESULTS.md`](docs/REPLICATION_RESULTS.md) — verified EfficientPIE replication metrics
-- [`docs/SESSION_NOTES_2026-03-10.md`](docs/SESSION_NOTES_2026-03-10.md) — bug fixes and replication notes
-- [`docs/SESSION_NOTES_2026-03-10b.md`](docs/SESSION_NOTES_2026-03-10b.md) — SparseTemporalPIE implementation notes
+- [`docs/SESSION_NOTES_2026-03-10.md`](docs/SESSION_NOTES_2026-03-10.md) — EfficientPIE bug fixes and replication
+- [`docs/SESSION_NOTES_2026-03-10b.md`](docs/SESSION_NOTES_2026-03-10b.md) — SparseTemporalPIE initial design
+- [`docs/SESSION_NOTES_2026-03-11.md`](docs/SESSION_NOTES_2026-03-11.md) — keypoint extraction, calibration, architecture revision
 
 ---
 

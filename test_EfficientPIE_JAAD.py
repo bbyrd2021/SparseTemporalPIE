@@ -74,7 +74,7 @@ def main(args):
     model = EfficientPIE(num_classes=2).to(device)
     print(model)
     # load model weights
-    model_weight_path = "./weights/transfer_noisy_model_JAAD.pth"
+    model_weight_path = args.weights
     model.load_state_dict(torch.load(model_weight_path, map_location=device))
     # test accuracy
     print("using the weight:{}".format(model_weight_path))
@@ -123,7 +123,10 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--data-path', type=str,
-                        default="/home/yphe/FangQu_temporary/JAAD")  # absolute path
-    parser.add_argument('--device', default='cuda:2', help='device id (i.e. 0 or 0,1 or cpu)')
+                        default="/data/datasets/JAAD")  # absolute path
+    parser.add_argument('--weights', type=str,
+                        default="weights_v8/best_model_JAAD_IL_step14_new.pth",
+                        help='model weights path')
+    parser.add_argument('--device', default='cuda:0', help='device id (i.e. 0 or 0,1 or cpu)')
     opt = parser.parse_args()
     main(opt)

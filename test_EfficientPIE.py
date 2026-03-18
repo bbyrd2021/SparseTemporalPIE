@@ -14,8 +14,8 @@ import torch
 from torch.utils.data import DataLoader
 from torchvision import transforms
 from utils.pie_data import PIE
-from utils.my_dataset import MyDataSet
-from models.EfficientPIE_backup import EfficientPIE
+from utils.my_dataset import MyDataSet, filter_existing_sequences
+from models.EfficientPIE import EfficientPIE
 from utils.train_val import evaluate
 
 
@@ -52,6 +52,7 @@ def main(args):
     test_seq = PIE_dataset.generate_data_trajectory_sequence('test', **data_opts)
     seq_length = data_opts['max_size_observe']
     test_seq_for_dataset = PIE_dataset.get_train_val_data(test_seq, data_type, seq_length, data_opts['seq_overlap_rate'])
+    test_seq_for_dataset = filter_existing_sequences(test_seq_for_dataset, 14, seq_length)
 
     # define the transform
     data_transform = {
@@ -73,8 +74,7 @@ def main(args):
     model = EfficientPIE(num_classes=2).to(device)
     print(model)
     # load model weights
-    version = args.version
-    model_weight_path = f"./weights_v{version}/model_8_PIE_IL_step14_new.pth"
+    model_weight_path = args.weights
     model.load_state_dict(torch.load(model_weight_path, map_location=device))
     # test
     print("using the weight:{}".format(model_weight_path))
@@ -124,7 +124,10 @@ if __name__ == '__main__':
     parser.add_argument('--version', type=int, default=8)
     # PIE dataset path
     parser.add_argument('--data-path', type=str,
-                        default="/home/yphe/FangQu_temporary/PIEDataset")  # absolute path
-    parser.add_argument('--device', default='cuda:6', help='device id (i.e. 0 or 0,1 or cpu)')
+                        default="/data/datasets/PIE")  # absolute path
+    parser.add_argument('--weights', type=str,
+                        default="weights_v8/best_model_PIE_IL_step14_new.pth",
+                        help='model weights path')
+    parser.add_argument('--device', default='cuda:0', help='device id (i.e. 0 or 0,1 or cpu)')
     opt = parser.parse_args()
     main(opt)

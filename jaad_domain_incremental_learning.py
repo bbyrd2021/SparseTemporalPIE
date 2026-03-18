@@ -1,9 +1,8 @@
 """
 
-@ Description:
+@ Description: JAAD Domain Incremental Learning
 @ Project:APCIL
 @ Author:qufang
-@ Create:2024/7/22 12:58
 
 """
 import argparse
@@ -15,11 +14,10 @@ from torch.optim import lr_scheduler
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader
 from torchvision import transforms
-
 from utils.jaad_data import JAAD
 from utils.my_dataset import MyDataSet
 from models.EfficientPIE import EfficientPIE
-from utils.train_val import train_one_epoch, evaluate
+from utils.train_val import train_one_epoch, evaluate, incremental_learning_train
 
 
 def main(args):
@@ -28,23 +26,22 @@ def main(args):
     print(args)
     print('Start Tensorboard with "tensorboard --logdir=runs", view at http://localhost:6006/')
     tb_writer = SummaryWriter()
-    if os.path.exists("./weights") is False:
-        os.makedirs("./weights")
+    version = args.version
+    if os.path.exists(f"./weights_v{version}") is False:
+        os.makedirs(f"./weights_v{version}")
 
-    data_opts = {'fstride': 1,  # The stride specifies the sampling resolution, i.e. every nth frame is used for processing.
+    data_opts = {'fstride': 1,
                  'sample_type': 'all',
-                 'height_rng': [0, float('inf')], # use pedestrains within 0px - infinite px
-                 # This parameter can be used to fix the aspect ratio (width/height) of bounding boxes.
-                 'squarify_ratio': 0,  # 0 means the original bounding boxes are returned.
-                 'data_split_type': 'random',  # kfold, random, default
-                 'seq_type': 'intention',  # crossing , intention
-                 'min_track_size': 0,  # discard tracks that are shorter
-                 'max_size_observe': 15,  # number of observation frames
-                 # 'max_size_predict': 5,  # number of prediction frames, no use
-                 'seq_overlap_rate': 0.5,  # how much consecutive sequences overlap
-                 'balance': True,  # balance the training and testing samples
-                 'crop_type': 'context',  # crop 2x size of bbox around the pedestrian
-                 'crop_mode': 'pad_resize',  # pad with 0s and resize to VGG input
+                 'height_rng': [0, float('inf')],
+                 'squarify_ratio': 0,
+                 'data_split_type': 'random',
+                 'seq_type': 'intention',
+                 'min_track_size': 0,
+                 'max_size_observe': 15,
+                 'seq_overlap_rate': 0.5,
+                 'balance': True,
+                 'crop_type': 'context',
+                 'crop_mode': 'pad_resize',
                  'encoder_input_type': [],
                  'decoder_input_type': ['bbox'],
                  'output_type': ['intent']
@@ -53,22 +50,17 @@ def main(args):
     data_type = {'encoder_input_type': data_opts['encoder_input_type'],
                  'decoder_input_type': data_opts['decoder_input_type'],
                  'output_type': data_opts['output_type']}
-
-
-    # get the dataset api
     JAAD_dataset = JAAD(data_path=args.data_path)
-
-    # random: all 40046
     train_seq_unbalanced = JAAD_dataset.generate_data_trajectory_sequence('train', **data_opts)
     train_seq = train_seq_unbalanced
     val_seq_unbalanced = JAAD_dataset.generate_data_trajectory_sequence('val', **data_opts)
     val_seq = val_seq_unbalanced
     seq_length = data_opts['max_size_observe']
 
-    train_seq_for_dataset = JAAD_dataset.get_train_val_data(train_seq, data_type, seq_length, data_opts['seq_overlap_rate'])
+    train_seq_for_dataset = JAAD_dataset.get_train_val_data(train_seq, data_type, seq_length,
+                                                             data_opts['seq_overlap_rate'])
     val_seq_for_dataset = JAAD_dataset.get_train_val_data(val_seq, data_type, seq_length, data_opts['seq_overlap_rate'])
 
-    # define the transform
     data_transform = {
         "train": transforms.Compose([transforms.Resize([300, 300]),
                                      transforms.RandomHorizontalFlip(),
@@ -84,8 +76,6 @@ def main(args):
     # define dataset, for dataloader
     train_dataset = MyDataSet(images_seq=train_seq_for_dataset, data_opts=data_opts, transform=data_transform['train'], step=args.step)
     val_dataset = MyDataSet(images_seq=val_seq_for_dataset, data_opts=data_opts, transform=data_transform['val'], step=args.step)
-    print("train set length:{}".format(train_dataset.__len__()))
-    print("val set length:{}".format(val_dataset.__len__()))
     # set the training parameters
     nw = min([os.cpu_count(), args.batch_size if args.batch_size > 1 else 0, 8])  # number of workers
     print('Using {} dataloader workers every process'.format(nw))
@@ -94,40 +84,47 @@ def main(args):
                               shuffle=True, pin_memory=True,
                               num_workers=nw, collate_fn=train_dataset.collate_fn)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size,
-                            shuffle=True, pin_memory=True,
+                            shuffle=False, pin_memory=True,
                             num_workers=nw, collate_fn=val_dataset.collate_fn)
 
     model = EfficientPIE(num_classes=2).to(device)
-    # load the pre-trained weight
-    if args.weights != "":
-        if os.path.exists(args.weights):
-            weights_dict = torch.load(args.weights, map_location=device)
-            load_weights_dict = {k: v for k, v in weights_dict.items()
-                                 if model.state_dict()[k].numel() == v.numel()}
-            print(model.load_state_dict(load_weights_dict, strict=False))
-        else:
-            raise FileNotFoundError("not found weights file: {}".format(args.weights))
+    # only load the feature extraction layers of prev model
+    weights_dict = torch.load(args.prev_weights, map_location=device)
+    load_weights_dict = {k: v for k, v in weights_dict.items() if k in model.state_dict()
+                         and model.state_dict()[k].numel() == v.numel()
+                         and not k.startswith('classifier')
+                         }
+    print(model.load_state_dict(load_weights_dict, strict=False))
+
+    # load the model of prev step
+    prev_model = EfficientPIE(num_classes=2).to(device)
+    weights_dict = torch.load(args.prev_weights, map_location=device)
+    load_weights_dict = {k: v for k, v in weights_dict.items()
+                         if prev_model.state_dict()[k].numel() == v.numel()}
+    print(prev_model.load_state_dict(load_weights_dict, strict=False))
 
     # optimizer
     pg = [p for p in model.parameters() if p.requires_grad]
     optimizer = optim.RMSprop(pg, lr=args.lr, weight_decay=0.0001)
-    scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=0.000001)
+    scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-7)
 
     # train and validate
     best_val_acc = 0.0
     min_loss = 100.0
-    save_path = "./weights/transfer_best_model_JAAD.pth"
-    min_loss_path = "./weights/transfer_min_loss_model_JAAD.pth"
+    save_path = f"./weights_v{version}/best_model_JAAD_IL_step{args.step}_new.pth"
+    min_loss_path = f"./weights_v{version}/min_loss_JAAD_IL_step{args.step}_new.pth"
     print(model)
     print("Start Training now!")
     for epoch in range(args.epochs):
-        train_loss, train_acc, train_precision, train_recall, train_f1 = train_one_epoch(model=model,
-                                                                                         optimizer=optimizer,
-                                                                                         dataloader=train_loader,
-                                                                                         device=device,
-                                                                                         epoch=epoch,
-                                                                                         total_epochs=args.epochs)
-        scheduler.step()  # learning rate will be changed
+        train_loss, train_acc, train_precision, \
+        train_recall, train_f1 = incremental_learning_train(model=model,
+                                                            optimizer=optimizer,
+                                                            dataloader=train_loader,
+                                                            device=device,
+                                                            epoch=epoch,
+                                                            prev_model=prev_model,
+                                                            total_epochs=args.epochs)
+        scheduler.step()
         val_loss, val_acc, val_precision, val_recall, val_f1 = evaluate(model=model,
                                                                         dataloader=val_loader,
                                                                         device=device,
@@ -155,9 +152,10 @@ def main(args):
         if val_loss < min_loss:
             min_loss = val_loss
             torch.save(model.state_dict(), min_loss_path)
-            print(f'Saved min loss model at epoch {epoch} with validation accuracy: {val_acc:.4f}, loss: {val_loss:.4f}')
-        if epoch >= 20:
-            torch.save(model.state_dict(), "./weights/transfer_model-{}_JAAD.pth".format(epoch))
+            print(
+                f'Saved min loss model at epoch {epoch} with validation accuracy: {val_acc:.4f}, loss: {val_loss:.4f}')
+        if epoch >= 5:
+            torch.save(model.state_dict(), f"./weights_v{version}/model_{epoch}_JAAD_IL_step{args.step}_new.pth")
             print(f'Saved model at epoch {epoch} with validation accuracy: {val_acc:.4f}, loss: {val_loss:.4f}')
 
     print("Finished Training!")
@@ -165,15 +163,15 @@ def main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--lr', type=float, default=0.00001)
+    parser.add_argument('--lr', type=float, default=1e-5)
     parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--epochs', type=int, default=50)
-    parser.add_argument('--step', type=int, default=0)
-    # dataset path
+    parser.add_argument('--epochs', type=int, default=30)
+    parser.add_argument('--version', type=int, default=8)
+    parser.add_argument('--step', type=int, default=14)
+    parser.add_argument('--prev_weights', type=str, default="weights_v8/best_model_JAAD_IL_step12_new.pth")
+    # JAAD dataset path
     parser.add_argument('--data-path', type=str,
                         default="/data/datasets/JAAD")  # absolute path
-    parser.add_argument('--weights', type=str, default="pre_train_weights/min_loss_pretrained_model_imagenet.pth",
-                        help='initial weights path')
     parser.add_argument('--device', default='cuda:0', help='device id (i.e. 0 or 0,1 or cpu)')
     opt = parser.parse_args()
     main(opt)

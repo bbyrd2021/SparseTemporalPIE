@@ -1114,6 +1114,7 @@ class PIE(object):
         intention_prob, intention_binary = [], []
         image_seq, pids_seq = [], []
         box_seq, center_seq, occ_seq = [], [], []
+        speed_seq, action_seq, look_seq = [], [], []
         # image_set_nums = {'train': ['set01', 'set02', 'set04'],
         #                           'val': ['set05', 'set06'],
         #                           'test': ['set03'],
@@ -1141,6 +1142,12 @@ class PIE(object):
                     images = [self._get_image_path(sid, vid, f) for f in frame_ids]
                     occlusions = pid_annots[pid]['occlusion'][start_idx:end_idx + 1]  # '+1' means include the frame of end_idx
 
+                    # -- Context features for SparseTemporalPIE v3 --
+                    vid_annots = annotations[sid][vid].get('vehicle_annotations', {})
+                    speeds = [[vid_annots.get(f, {}).get('OBD_speed', 0.0)] for f in frame_ids]
+                    actions = [[a] for a in pid_annots[pid]['behavior']['action'][start_idx:end_idx + 1]]
+                    looks = [[l] for l in pid_annots[pid]['behavior']['look'][start_idx:end_idx + 1]]
+
                     if height_rng[0] > 0 or height_rng[1] < float('inf'):
                         images, boxes, frame_ids, occlusions = self._height_check(height_rng,
                                                                                   frame_ids, boxes,
@@ -1165,6 +1172,10 @@ class PIE(object):
                     ped_ids = [[pid]] * len(boxes)
                     pids_seq.append(ped_ids[::seq_stride])
 
+                    speed_seq.append(speeds[::seq_stride])
+                    action_seq.append(actions[::seq_stride])
+                    look_seq.append(looks[::seq_stride])
+
         print('Subset: %s' % image_set)
         print('Number of pedestrians: %d ' % num_pedestrians)
         print('Total number of samples: %d ' % len(image_seq))
@@ -1174,7 +1185,10 @@ class PIE(object):
                 'occlusion': occ_seq,
                 'intention_prob': intention_prob,
                 'intention_binary': intention_binary,
-                'ped_id': pids_seq}
+                'ped_id': pids_seq,
+                'obd_speed': speed_seq,
+                'action': action_seq,
+                'look': look_seq}
 
     # revise the pie_data.py
     def get_train_val_data(self, data, data_type, seq_length, overlap):
@@ -1195,12 +1209,16 @@ class PIE(object):
         if len(decoder_input) == 0:
             decoder_input = np.zeros(shape=np.array(bboxes).shape)
 
-        return {'images': images,
-                'bboxes': bboxes,
-                'ped_ids': ped_ids,
-                'encoder_input': encoder_input,
-                'decoder_input': decoder_input,
-                'output': output}
+        result = {'images': images,
+                  'bboxes': bboxes,
+                  'ped_ids': ped_ids,
+                  'encoder_input': encoder_input,
+                  'decoder_input': decoder_input,
+                  'output': output}
+        for extra_key in ('obd_speed', 'action', 'look'):
+            if extra_key in tracks:
+                result[extra_key] = tracks[extra_key]
+        return result
 
     def get_tracks(self, dataset, data_type, seq_length, overlap):
         """
@@ -1229,6 +1247,11 @@ class PIE(object):
             d['intention_binary'] = dataset['intention_binary']
         if 'intention_prob' in d_types:
             d['intention_prob'] = dataset['intention_prob']
+
+        # Pass through context features for SparseTemporalPIE v3
+        for extra_key in ('obd_speed', 'action', 'look'):
+            if extra_key in dataset:
+                d[extra_key] = dataset[extra_key]
 
         bboxes = dataset['bbox'].copy()
         images = dataset['image'].copy()

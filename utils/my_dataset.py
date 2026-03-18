@@ -12,8 +12,26 @@ import random
 from PIL import Image
 import torch
 from torch.utils.data import Dataset
-from utils.adaptive_selection import adaptive_selection
 from torchvision.transforms import functional as F
+
+
+def filter_existing_sequences(images_seq: dict, step: int, max_size_observe: int = 15) -> dict:
+    """Remove sequences whose target frame image doesn't exist on disk.
+    Useful when only a subset of videos have been extracted."""
+    frame_idx = step if step is not None else (max_size_observe - 1)
+    n = len(images_seq['images'])
+    valid = [i for i, imgs in enumerate(images_seq['images'])
+             if os.path.exists(imgs[frame_idx])]
+    if len(valid) < n:
+        print(f"Filtered sequences: {len(valid)}/{n} have extracted images at step={step}")
+    result = {}
+    for k, v in images_seq.items():
+        if hasattr(v, '__len__') and len(v) == n:
+            result[k] = [v[i] for i in valid]
+        else:
+            result[k] = v  # keep as-is (e.g. empty encoder_input list)
+    return result
+
 
 class MyDataSet(Dataset):
 
@@ -90,7 +108,7 @@ class MyDataSet(Dataset):
         #     sequence.append(single_img)
         # sequence = torch.cat(sequence, dim=0)
         # return sequence, label
-        reverse_step = 1
+        reverse_step = (self.data_opts['max_size_observe'] - self.step) if self.step is not None else 1
         last_img = each_seq_imgs[self.data_opts['max_size_observe'] - reverse_step]
         last_bbox = each_seq_bboxes[self.data_opts['max_size_observe'] - reverse_step]
         last_label = each_seq_labels[self.data_opts['max_size_observe'] - reverse_step]

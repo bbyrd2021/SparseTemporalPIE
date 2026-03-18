@@ -17,8 +17,8 @@ from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader
 from torchvision import transforms
 from utils.pie_data import PIE
-from utils.my_dataset import MyDataSet
-from models.EfficientPIE_backup import EfficientPIE
+from utils.my_dataset import MyDataSet, filter_existing_sequences
+from models.EfficientPIE import EfficientPIE
 from utils.train_val import train_one_epoch, evaluate, incremental_learning_train
 
 
@@ -62,6 +62,8 @@ def main(args):
     train_seq_for_dataset = PIE_dataset.get_train_val_data(train_seq, data_type, seq_length,
                                                            data_opts['seq_overlap_rate'])
     val_seq_for_dataset = PIE_dataset.get_train_val_data(val_seq, data_type, seq_length, data_opts['seq_overlap_rate'])
+    train_seq_for_dataset = filter_existing_sequences(train_seq_for_dataset, args.step, seq_length)
+    val_seq_for_dataset = filter_existing_sequences(val_seq_for_dataset, args.step, seq_length)
 
     data_transform = {
         "train": transforms.Compose([transforms.Resize([300, 300]),
@@ -109,7 +111,7 @@ def main(args):
     pg = [p for p in model.parameters() if p.requires_grad]
     optimizer = optim.RMSprop(pg, lr=args.lr, weight_decay=0.0001)
     # optimizer = optim.AdamW(pg, lr=args.lr, weight_decay=1e-4)
-    scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=30, eta_min=1e-7)
+    scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-7)
 
     # train and validate
     best_val_acc = 0.0
@@ -125,7 +127,8 @@ def main(args):
                                                             dataloader=train_loader,
                                                             device=device,
                                                             epoch=epoch,
-                                                            prev_model=prev_model)
+                                                            prev_model=prev_model,
+                                                            total_epochs=args.epochs)
         scheduler.step()  # learning rate will be changed
         val_loss, val_acc, val_precision, val_recall, val_f1 = evaluate(model=model,
                                                                         dataloader=val_loader,
@@ -178,12 +181,10 @@ if __name__ == '__main__':
     parser.add_argument('--prev_weights', type=str, default="weights_v8/model_6_PIE_IL_step12.pth")
     # PIE dataset path
     parser.add_argument('--data-path', type=str,
-                        default="/home/yphe/FangQu_temporary/PIEDataset")  # absolute path
+                        default="/data/datasets/PIE")  # absolute path
     parser.add_argument('--weights', type=str,
-                        default="pre_train_weights_efficientpie/min_loss_pretrained_model_imagenet_backup.pth",
+                        default="pre_train_weights/min_loss_pretrained_model_imagenet.pth",
                         help='initial weights path')
-    # parser.add_argument('--weights', type=str, default="",
-    #                     help='initial weights path')
     parser.add_argument('--device', default='cuda:0', help='device id (i.e. 0 or 0,1 or cpu)')
     opt = parser.parse_args()
     main(opt)
