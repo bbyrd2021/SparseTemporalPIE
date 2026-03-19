@@ -1,547 +1,339 @@
-# SparseTemporalPIE — Complete Implementation Guide
+# SparseTemporalPIE — Architecture and Implementation Guide
 
-> Forked from [EfficientPIE](https://github.com/heinideyibadiaole/EfficientPIE) (IJCAI-25)
 > Authors: Brandon Byrd, Abel Abebe Bzuayene — xDI Lab, NC A&T State University
+> Fork of [EfficientPIE](https://github.com/heinideyibadiaole/EfficientPIE) (IJCAI-25)
 
 ---
 
 ## Table of Contents
 
 1. [Architecture Overview](#1-architecture-overview)
-2. [Repository Structure](#2-repository-structure)
-3. [Design Decisions](#3-design-decisions)
-4. [File-by-File Implementation](#4-file-by-file-implementation)
-   - 4.1 [models/SparseTemporalPIE.py](#41-modelssparsetemporalpiepy)
-   - 4.2 [utils/sparse_dataset.py](#42-utilssparse_datasetpy)
-   - 4.3 [utils/change_detector.py](#43-utilschange_detectorpy-ablation-only)
-   - 4.4 [train_SparseTemporalPIE.py](#44-train_sparsetemporalpiepy)
-   - 4.5 [pie_sparse_incremental_learning.py](#45-pie_sparse_incremental_learningpy)
-   - 4.6 [test_SparseTemporalPIE.py](#46-test_sparsetemporalpiepy)
-   - 4.7 [run_sparse_pie_pipeline.sh](#47-run_sparse_pie_pipelinesh)
+2. [Design Evolution (v1 → v4)](#2-design-evolution)
+3. [Repository Structure](#3-repository-structure)
+4. [File-by-File Reference](#4-file-by-file-reference)
 5. [Training Protocol](#5-training-protocol)
 6. [Evaluation Protocol](#6-evaluation-protocol)
-7. [Ablation Study Design](#7-ablation-study-design)
-8. [Expected Results & Baselines](#8-expected-results--baselines)
-9. [Key Implementation Notes](#9-key-implementation-notes)
+7. [Results Summary](#7-results-summary)
+8. [Key Implementation Notes](#8-key-implementation-notes)
 
 ---
 
 ## 1. Architecture Overview
 
-```
-Observation window: 15 frames (indices 0–14), at IL step N we use index N.
-
-F* SELECTION (in SparseDataset, CPU)
-─────────────────────────────────────
-For each frame t in [0, step-1]:
-    embed_t = backbone(crop(frame_t, bbox_t))          # frozen backbone, CPU copy
-
-f* = argmax  cosine_distance(embed_current, embed_t)
-     t ∈ [0, step-1]
-
-(at step=0, f* = frame 0 — no prior frames available)
-
-FORWARD PASS (GPU)
-──────────────────
-f_current (300×300 crop) ──► frozen backbone ──► embed_current (1280)
-f*        (300×300 crop) ──► frozen backbone ──► embed_fstar   (1280)
-
-CrossAttention(Q=embed_current, K=embed_fstar, V=embed_fstar)
-    │
-    attn_out (1280)
-    │
-residual + LayerNorm:  enriched_0 = LayerNorm(embed_current + attn_out)
-    │
-FeedForward (1280 → 512 → 1280):  enriched = LayerNorm(enriched_0 + FF(enriched_0))
-    │
-    enriched (1280)
-
-pose_feats (34) ← normalize_pose(keypoints_pid/{pid}/{frame_id}.npy, bbox)
-                  17 joints × (norm_x, norm_y); low-conf joints set to 0
-
-concat([enriched, pose_feats])  →  1314-d
-    │
-Classifier: Linear(1314→256) → ReLU → Dropout → Linear(256→2)
-    │
-logits  →  crossing probability
-```
-
-**What f\* represents semantically:**
-The frame in the observation window that looks *most different* from the current moment,
-according to the frozen backbone's visual representation. If the pedestrian is mid-turn,
-shifting weight, or changing gaze direction, that frame will pull apart from f\_current
-in embedding space. Cross-attention then asks: "given what f\* looked like then and what
-f\_current looks like now, what changed?" The pose features independently encode the
-current body configuration, providing a complementary signal.
-
-**Why this replaces ChangeDetector:**
-An earlier design used a ViTPose-based ChangeDetector (head orientation delta, body lean
-delta, gaze vector delta) calibrated on PIE behavioral annotations. Calibration AUC
-reached only 0.54 (barely above random), confirmed by 100%-hit-rate keypoints from
-correctly-cropped ViTPose extraction. Root causes: many PIE pedestrians have small
-bounding boxes (bbox\_h < 60px) degrading pose quality; the binary fired/not-fired
-signal discards too much temporal information. Embedding-distance f\* selection uses the
-backbone's own rich visual features and requires no calibration.
-
----
-
-## 2. Repository Structure
-
-Fork from EfficientPIE. New and modified files marked.
+### v3 (Best Results)
 
 ```
-EfficientPIE/  (forked)
-│
-├── models/
-│   ├── __init__.py
-│   ├── common.py                          # UNCHANGED — DropPath, SE, FusedMBConv, MBConv
-│   ├── EfficientPIE.py                    # UNCHANGED — baseline model
-│   └── SparseTemporalPIE.py               # NEW — temporal cross-attention model
-│
-├── utils/
-│   ├── __init__.py
-│   ├── my_dataset.py                      # UNCHANGED — EfficientPIE dataset
-│   ├── train_val.py                       # MODIFIED — added evaluate_sparse(),
-│   │                                      #            incremental_learning_train_sparse()
-│   ├── change_detector.py                 # NEW (ablation only — not used in pipeline)
-│   └── sparse_dataset.py                  # NEW — SparseDataset (f_current, f*, pose_feats)
-│
-├── train_EfficientPIE.py                  # UNCHANGED
-├── pie_domain_incremental_learning.py     # UNCHANGED
-├── test_EfficientPIE.py                   # UNCHANGED
-│
-├── train_SparseTemporalPIE.py             # NEW — base training (step=0, 50 epochs)
-├── pie_sparse_incremental_learning.py     # NEW — IL steps 2→14 (30 epochs each)
-├── test_SparseTemporalPIE.py              # NEW — eval + v=0 subset metrics
-│
-├── run_sparse_pie_pipeline.sh             # NEW — step0 + IL + eval automation
-├── extract_frames.py                      # EXISTING — video → frames (one-time)
-├── extract_keypoints.py                   # NEW — ViTPose keypoint extraction (one-time)
-├── calibrate_change_detector.py           # NEW (ablation tool — not in pipeline)
-└── pre_train_weights/
-    └── min_loss_pretrained_model_imagenet.pth   # EXISTING
+Inputs:
+  f_current    — (B, 3, 300, 300)  current frame crop at IL step t
+  f_context    — (B, K, 3, 300, 300)  K=4 evenly-spaced context frames from [0, t-1]
+  context_mask — (B, K)  1.0=real frame, 0.0=padding
+  pose_current — (B, 68)  34-d static keypoints + 34-d velocity (delta vs prev frame)
+  pose_context — (B, K, 68)  poses for each context frame
+  bbox_traj    — (B, 12)  trajectory stats over [0, t]: displacement, velocity,
+                           acceleration, size ratio
+  ctx_feats    — (B, 5)   [OBD_speed@t, mean_speed[0:t], speed_valid, action@t, look@t]
+
+Forward pass:
+  1. Batch all K+1 frames through shared backbone → (B, K+1, 1280)
+  2. Fuse pose into each embedding: emb += pose_proj(pose)
+  3. Cross-attention: Q=emb_current, K/V=emb_context[0..K]
+     - key_padding_mask ignores padded context frames
+  4. Residual + LayerNorm + FeedForward(1280→512→1280) + LayerNorm → enriched (1280)
+  5. ctx_proj(concat[bbox_traj, ctx_feats]) → ctx (128)   [late fusion]
+  6. classifier(concat[enriched, ctx]) → logits (2)
+
+Architecture:
+  backbone      ~684K params  (EfficientPIE CNN, partially unfrozen during training)
+  pose_proj     Linear(68→1280, bias=False)
+  cross_attn    MultiheadAttention(1280, num_heads=8, batch_first=False)
+  attn_norm     LayerNorm(1280)
+  ff            Linear(1280→512) → GELU → Dropout → Linear(512→1280) → Dropout
+  ff_norm       LayerNorm(1280)
+  ctx_proj      Linear(17→128) → GELU → Dropout → Linear(128→128)
+  classifier    Linear(1408→256) → ReLU → Dropout → Linear(256→2)
+  Total         ~9.0M params
 ```
 
-**Data paths:**
-```
-/data/datasets/PIE/
-  images/setXX/video_XXXX/XXXXX.png       # extracted frames
-  keypoints_pid/{pid}/{frame_id}.npy       # ViTPose keypoints (17×3), abs frame number
-  annotations/ (symlinked)
-  PIE_clips/setXX/ (symlinked)
+### v4 (Ablation — no cross-attention)
 
-/data/datasets/JAAD/
-  images/video_XXXX/XXXXX.png
-  annotations/ (symlinked)
+```
+Inputs:
+  f_current    — (B, 3, 300, 300)
+  pose_current — (B, 34)  static keypoints only (velocity dropped)
+  bbox_traj    — (B, 12)
+  ctx_feats    — (B, 5)
+
+Forward pass:
+  1. backbone(f_current) → emb (1280)
+  2. emb += pose_proj(pose_current)
+  3. ctx_proj(concat[bbox_traj, ctx_feats]) → ctx (128)
+  4. classifier(concat[emb, ctx]) → logits (2)
+
+Architecture:
+  backbone      ~684K params
+  pose_proj     Linear(34→1280, bias=False)
+  ctx_proj      Linear(17→128) → GELU → Dropout → Linear(128→128)
+  classifier    Linear(1408→256) → ReLU → Dropout → Linear(256→2)
+  Total         ~1.1M params
 ```
 
 ---
 
-## 3. Design Decisions
+## 2. Design Evolution
 
-| Decision | Choice | Rationale |
-|---|---|---|
-| Backbone | EfficientPIE (shared, Siamese) | Clean comparison; attribution of delta is purely from temporal mechanism |
-| Backbone weights | Trained PIE IL-step-14 weights, **frozen** | Accuracy delta attributable to temporal mechanism alone; no catastrophic forgetting |
-| f\* selection | argmax cosine distance from embed\_current in [0, step-1] | No calibration; uses backbone's own feature space; captures largest visual change |
-| f\* at step=0 | frame 0 (same as f\_current) | No prior frames; cross-attention is a no-op (identical Q and K/V) |
-| Pose features | 34-dim normalized keypoint vector for f\_current | Rich body-pose signal; complements temporal attention context; 17 joints, no conf channel needed after thresholding |
-| Pose normalization | Divide by bbox width/height | Removes camera/distance variation; coords ∈ [0,1] approximately |
-| Low-conf keypoints | Zeroed (conf < 0.25) | Avoids noisy joints misleading the classifier; zero is distinguishable from valid keypoints near bbox boundary |
-| Hard gate | **Removed** | pose\_feats already encode "no pose" via zeros; gate introduced an information bottleneck without benefit |
-| Classifier input | concat([enriched, pose\_feats]) → 1314-d | Pose provides explicit body config; attention provides temporal delta |
-| Classifier head | Linear(1314→256) → ReLU → Dropout → Linear(256→2) | 256 hidden dim adequate for 1314-d input; extra layer vs. original 1281→2 |
-| Backbone in dataset | CPU deep-copy (pickle-safe) | Embedding-distance f\* computed in `__getitem__` → must be multiprocessing-safe |
-| IL strategy | Inherited from EfficientPIE (IDIL + adaptive loss) | Compatible; backbone freeze simplifies IL (only attention head + FF + classifier drift) |
-| ViTPose model | `usyd-community/vitpose-base-coco-aic-mpii` (ViTPose-B) | Best HF-available model; COCO+AIC+MPII training |
-| ChangeDetector | Kept in codebase (**ablation only**) | Ablation A6: compare embedding-distance vs. threshold-based f\* selection |
+| Version | Key Change | Val Acc | Test Acc |
+|---------|-----------|---------|----------|
+| v1 | Single f* via cosine distance, frozen backbone, 34-d pose | ~0.865 | — |
+| v2 | Unfrozen backbone, synchronized flip, pose dropout | ~0.868 | — |
+| v3 | K=4 multi-frame cross-attention, 68-d pose (+ velocity), bbox_traj, ctx_feats | ~0.870 | **0.9261** |
+| v4 | Dropped cross-attention and pose velocity; single frame + ctx MLP only | ~0.874 | 0.9194 |
 
----
+**Key insight:** Validation accuracy was a misleading signal throughout (val set = ~92
+pedestrians, ~500 samples). v3 appeared to ceiling at 0.870 val but achieved 0.9261 on
+test. v4 peaked higher on val (0.874) but lower on test (0.9194). The cross-attention
+mechanism benefits most from the full IL chain — v3 improves monotonically to step 14
+while v4 degrades after step 2.
 
-## 4. File-by-File Implementation
+**Why cross-attention on adjacent frames works:** Although adjacent frames are visually
+similar, the cross-attention over K=4 evenly-spaced frames spanning [0, t-1] gives
+the model a reference trajectory. The attention learns to selectively pull in the most
+relevant historical visual context for each query position. This is most valuable at
+later IL steps (step 14) when the observation window spans the full 15-frame sequence.
 
 ---
 
-### 4.1 `models/SparseTemporalPIE.py`
+## 3. Repository Structure
 
-**Purpose:** Full model definition. Wraps a frozen EfficientPIE backbone as a shared
-encoder, adds cross-attention fusion, feedforward layer, and classifier head that accepts
-normalized pose features.
-
-**Key classes/functions:**
-
-- `SparseTemporalPIE(num_heads=8, ff_hidden=512, dropout=0.1)` — the full model
-- `encode(x)` — passes (B, 3, 300, 300) through frozen backbone → (B, 1280)
-- `forward(f_current, f_star, pose_feats)` — main forward pass
-- `load_backbone_weights(model, weights_path, device)` — loads EfficientPIE checkpoint
-  into backbone by mapping attribute names to Sequential indices
-
-**Parameter counts:**
-- Backbone: ~684K (frozen, not trained)
-- CrossAttention (8 heads, 1280-dim): ~6.6M
-- FeedForward (1280→512→1280): ~1.3M
-- Classifier (1314→256→2): ~336K
-- Total trainable: ~8.2M
-
-**Forward pass in detail:**
 ```
-f_current  (B, 3, 300, 300) → backbone → embed_current  (B, 1280)
-f_star     (B, 3, 300, 300) → backbone → embed_fstar    (B, 1280)
+models/
+  EfficientPIE.py                  # Unchanged baseline
+  SparseTemporalPIE.py             # v4 (current default)
+  SparseTemporalPIE_v3.py          # v3 (reconstructed for evaluation)
 
-# Cross-attention (seq_len=1 for both Q and K/V)
-q = embed_current.unsqueeze(0)   # (1, B, 1280)
-k = embed_fstar.unsqueeze(0)     # (1, B, 1280)
-v = embed_fstar.unsqueeze(0)     # (1, B, 1280)
-attn_out, _ = cross_attn(q, k, v)
-attn_out = attn_out.squeeze(0)   # (B, 1280)
+utils/
+  pie_data.py                      # Modified: added obd_speed, action, look extraction
+  jaad_data.py                     # Unchanged
+  my_dataset.py                    # EfficientPIE dataset (unchanged)
+  sparse_dataset.py                # v4 dataset — 5-tuple
+  sparse_dataset_v3.py             # v3 dataset — 8-tuple
+  train_val.py                     # Added evaluate_sparse(), incremental_learning_train_sparse()
 
-# Transformer-style residual blocks
-enriched_0 = attn_norm(embed_current + attn_out)          # (B, 1280)
-enriched   = ff_norm(enriched_0 + ff(enriched_0))         # (B, 1280)
+train_SparseTemporalPIE.py         # v4 step 0 training
+pie_sparse_incremental_learning.py # v4 IL steps 2→14
+test_SparseTemporalPIE.py          # v4 evaluation
+test_SparseTemporalPIE_v3.py       # v3 evaluation
 
-# Classifier
-combined = torch.cat([enriched, pose_feats], dim=1)        # (B, 1314)
-logits   = classifier(combined)                            # (B, 2)
+extract_frames.py                  # Video → frames (one-time, PIE + JAAD)
+extract_keypoints.py               # ViTPose-B extraction (one-time, PIE + JAAD)
+
+weights_sparse/                    # v3 step 0 base weights
+weights_sparse_v3/                 # v3 IL checkpoints steps 2–14
+weights_sparse_v4/                 # v4 IL checkpoints steps 0–14
+
+docs/
+  RESULTS.md                       # Full results and SOTA comparison
+  SPARSE_TEMPORAL_PIE.md           # This file
+  SESSION_NOTES_2026-03-18.md      # v3/v4 architecture decisions
+  SESSION_NOTES_2026-03-19.md      # Final test results and analysis
 ```
 
 ---
 
-### 4.2 `utils/sparse_dataset.py`
+## 4. File-by-File Reference
 
-**Purpose:** PyTorch Dataset that returns `(f_current, f_star, pose_feats, label)` per
-sample. Handles f\* selection via embedding cosine distance and pose feature loading.
+### `utils/pie_data.py` (modified)
 
-**Key functions:**
-
-`normalize_pose(kpts, bbox, conf_thresh=0.25) → np.ndarray (34,)`
-- Input: `kpts` (17, 3) array [x, y, conf] in full-frame pixel coords, `bbox` [x1,y1,x2,y2]
-- For each joint: if conf ≥ thresh, store `(x-x1)/bw` and `(y-y1)/bh`; else store 0,0
-- Returns float32 array of shape (34,)
-
-`SparseDataset.__init__(images_seq, data_opts, step, transform, keypoints_dir, backbone)`
-- `backbone`: optional frozen nn.Sequential — deep-copied to CPU, set to eval mode
-- A separate `_encode_transform` (no augmentation) is used for backbone encoding
-
-`SparseDataset._select_fstar(frame_paths, bboxes) → int`
-- Returns frame index in [0, step-1] with max cosine distance from f\_current embedding
-- Falls back to 0 if backbone is None or step == 0
-- Encodes [0..step] frames in one batch on CPU backbone; cosine\_similarity broadcasts
-
-`SparseDataset._load_pose_feats(pid, t, bbox) → np.ndarray (34,)`
-- Loads `{keypoints_dir}/{pid}/{frame_id}.npy` where frame\_id is extracted from image path
-- Returns zeros if file missing (graceful degradation)
-
-**Keypoint path convention:**
-```
-{keypoints_dir}/{pid}/{frame_id}.npy
-```
-where `frame_id` is the zero-padded absolute frame number from the image filename
-(e.g., `00123`). This avoids collision across non-overlapping observation windows for
-the same pedestrian. See SESSION_NOTES_2026-03-11 Bug 3.
-
-**`__getitem__` flow:**
-```
-1. f_star_idx  = _select_fstar(frame_paths, bboxes)
-2. pose_feats  = _load_pose_feats(pid, frame_id_at_step, bboxes[step])
-3. Load + crop f_current (frame_paths[step]) and f_star (frame_paths[f_star_idx])
-4. Apply self.transform to both crops
-5. Return (f_current_t, f_star_t, pose_feats_t, label_t)
-```
-
-**`collate_fn`:** stacks all four tensors — returns
-`(B,3,300,300), (B,3,300,300), (B,34), (B,)`
-
----
-
-### 4.3 `utils/change_detector.py` (ablation only)
-
-**Status:** Retained in codebase but **not called** by the training pipeline.
-
-**Purpose:** Original ViTPose-based keyframe selector using head orientation delta, body
-lean delta, and gaze vector delta signals. Threshold-based, calibrated via grid search
-on PIE behavioral annotations.
-
-**Why kept:** Needed for ablation A6 (compare embedding-distance f\* vs. threshold-based
-f\*). Import it explicitly in ablation scripts; do not import from sparse\_dataset.py.
-
-**Calibration result (2026-03-11):** Best AUC = 0.54 on PIE train set. Thresholds hit
-grid edges, indicating the binary signal is too weak. See SESSION_NOTES_2026-03-11 for
-full analysis.
-
----
-
-### 4.4 `train_SparseTemporalPIE.py`
-
-**Purpose:** Base training at IL step=0 (50 epochs). Trains all parameters except the
-frozen backbone.
-
-**Critical:** Model is constructed **before** datasets so `model.backbone` can be passed
-to `SparseDataset` for embedding-distance f\* selection:
+Three new sequences extracted per pedestrian in `_get_intention()`:
 
 ```python
-model = SparseTemporalPIE(num_heads=8, ff_hidden=512).to(device)
-model = load_backbone_weights(model, args.weights, device=args.device)
-
-train_dataset = SparseDataset(..., backbone=model.backbone)
-val_dataset   = SparseDataset(..., backbone=model.backbone)
+vid_annots = annotations[sid][vid].get('vehicle_annotations', {})
+speeds  = [[vid_annots.get(f, {}).get('OBD_speed', 0.0)] for f in frame_ids]
+actions = [[a] for a in pid_annots[pid]['behavior']['action'][start_idx:end_idx+1]]
+looks   = [[l] for l in pid_annots[pid]['behavior']['look'][start_idx:end_idx+1]]
 ```
 
-**At step=0:** f\_star = f\_current (same frame, no history). Cross-attention is a no-op
-(Q = K = V). The model learns from pose features and the embed\_current alone at this step.
-
-**Outputs:**
-- `weights_sparse/best_sparse_step0.pth` — best validation accuracy
-- `weights_sparse/min_loss_sparse_step0.pth` — minimum validation loss
-
-**CLI:**
-```bash
-python train_SparseTemporalPIE.py \
-    --weights   weights_v8/model_8_PIE_IL_step14_new.pth \
-    --keypoints-dir /data/datasets/PIE/keypoints_pid \
-    --step 0 --epochs 50 --device cuda:0
-```
+Passed through `get_tracks()` and `get_train_val_data()` as `obd_speed`, `action`, `look`
+keys. `filter_existing_sequences()` handles arbitrary keys generically — no changes needed there.
 
 ---
 
-### 4.5 `pie_sparse_incremental_learning.py`
+### `utils/sparse_dataset.py` (v4)
 
-**Purpose:** IL chain over steps [2, 4, 6, 8, 10, 12, 14]. Each step loads the previous
-step's best weights as a frozen `prev_model` for IL loss, and trains a `curr_model` that
-warm-starts from the same weights.
+Returns 5-tuple: `(f_current, pose_current, bbox_traj, ctx_feats, label)`
 
-**Model construction order (same pattern as train script):**
-```python
-prev_model = SparseTemporalPIE().to(device)
-prev_model.load_state_dict(torch.load(prev_weights))
-prev_model.eval(); freeze all params
-
-curr_model = SparseTemporalPIE().to(device)
-curr_model.load_state_dict(torch.load(prev_weights))
-freeze curr_model.backbone only
-
-# Pass curr_model backbone to datasets (already frozen, weights same as prev_model)
-train_dataset = SparseDataset(..., backbone=curr_model.backbone)
-val_dataset   = SparseDataset(..., backbone=curr_model.backbone)
-```
-
-**IL loss (inherited from EfficientPIE):**
-```
-loss_new = CrossEntropy(robust_noisy(pred_curr), labels)
-loss_old = loss_old_func(pred_prev.detach(), labels)
-loss = loss_new if loss_new > loss_old else 0.5 * loss_old + loss_new
-```
-
-**CLI:**
-```bash
-python pie_sparse_incremental_learning.py \
-    --weights weights_sparse/best_sparse_step0.pth \
-    --keypoints-dir /data/datasets/PIE/keypoints_pid \
-    --epochs 30 --device cuda:0
-```
+Key methods:
+- `_load_pose_feats(pid, frame_path, bbox)` — loads `keypoints_pid/{pid}/{frame_id:05d}.npy`
+- `_compute_bbox_trajectory(bboxes)` — 12-d stats over `bboxes[0:step+1]`
+- `_get_context_features(index)` — 5-d from `obd_speed`/`action`/`look` keys
+- Synchronized flip: image + pose (COCO left/right pairs swapped)
+- Pose dropout: both pose and image unchanged; pose zeroed with `p=0.1`
 
 ---
 
-### 4.6 `test_SparseTemporalPIE.py`
+### `utils/sparse_dataset_v3.py` (v3)
 
-**Purpose:** Evaluation on PIE test set. Reports two metric sets:
-1. **Overall** — full test set
-2. **v=0 subset** — stationary pedestrians (bbox center displacement < epsilon × bbox width)
+Returns 8-tuple: `(f_current, f_context, context_mask, pose_current, pose_context, bbox_traj, ctx_feats, label)`
 
-**Metrics:** Accuracy, AUC, F1, Precision (via sklearn).
-
-**Model loaded before dataset** (same pattern as train scripts):
-```python
-model = SparseTemporalPIE().to(device)
-model.load_state_dict(torch.load(args.weights))
-model.eval()
-
-test_dataset = SparseDataset(..., backbone=model.backbone)
-```
-
-**v=0 stationarity:**
-```python
-delta = sqrt((cx_N - cx_0)^2 + (cy_N - cy_0)^2) / bbox_width
-stationary = delta < epsilon   # default epsilon=5.0
-```
-Stationary pedestrians are harder cases — they exhibit less visual motion signal,
-so the temporal f\* mechanism is hypothesized to help more here.
-
-**CLI:**
-```bash
-python test_SparseTemporalPIE.py \
-    --weights weights_sparse/best_sparse_step14.pth \
-    --keypoints-dir /data/datasets/PIE/keypoints_pid \
-    --step 14 --device cuda:0
-```
+Additional methods:
+- `_select_context_indices()` — `np.linspace(0, step-1, min(K, step))` evenly spaced
+- `_load_pose_68d(pid, frame_paths, bboxes, idx)` — 34-d static + 34-d velocity
+- `collate_fn` — pads f_context and pose_context to K=4, builds mask tensor
 
 ---
 
-### 4.7 `run_sparse_pie_pipeline.sh`
+### `models/SparseTemporalPIE.py` (v4)
 
-Full automation: step 0 → IL steps 2–14 → evaluation.
+Single-frame forward pass. `load_backbone_weights()` maps EfficientPIE checkpoint keys
+to backbone Sequential indices (0=commonConv, 1=fm1, 2=fm2, 3=mb1, 4=mb2, 5=commonConv1).
 
-```bash
-bash run_sparse_pie_pipeline.sh
-```
+---
 
-Logs written to `training_logs_sparse/`:
-- `step0.log` — step 0 training
-- `il_steps.log` — IL steps 2–14
-- `evaluation.log` — final test set metrics
+### `models/SparseTemporalPIE_v3.py` (v3)
 
-Prerequisites:
-1. `python extract_frames.py --dataset pie`
-2. `python extract_keypoints.py --dataset pie --output-dir /data/datasets/PIE/keypoints_pid`
+Multi-frame forward pass. Architecture reconstructed from saved checkpoint weight shapes.
+`pose_proj` is shared across current and context frames.
 
-No calibration step required.
+---
+
+### `train_SparseTemporalPIE.py`
+
+v4 step 0 base training. Partial backbone unfreeze: backbone at `lr×0.1`, head at `lr`.
+CosineAnnealingWarmRestarts with `T_0=restart_period` (default 10).
+
+---
+
+### `pie_sparse_incremental_learning.py`
+
+v4 IL chain. `--start-step` allows resuming from any step. Same partial unfreeze and
+warm restart schedule as base training. Best val acc checkpoint passed as teacher for
+next step.
+
+---
+
+### `test_SparseTemporalPIE.py` / `test_SparseTemporalPIE_v3.py`
+
+Reports Accuracy, AUC, F1, Precision for:
+1. Full test set
+2. v=0 stationary subset (bbox center displacement < epsilon × bbox width, default epsilon=5.0)
 
 ---
 
 ## 5. Training Protocol
 
-### Step 0 (base training)
-
-| Param | Value |
-|---|---|
-| Epochs | 50 |
+| Hyperparameter | Value |
+|----------------|-------|
 | Optimizer | RMSprop |
-| LR | 1e-4 |
+| LR (head) | 1e-4 |
+| LR (backbone) | 1e-5 (10× lower) |
 | Weight decay | 1e-4 |
-| LR schedule | CosineAnnealingLR (eta_min=1e-7) |
+| LR schedule | CosineAnnealingWarmRestarts (T_0=7 for IL, T_0=10 for step 0) |
 | Batch size | 32 |
-| Augmentation | RandomHorizontalFlip, ColorJitter(b=0.5, c=0.5, s=0.5, h=0.1) |
-| Loss | CrossEntropyLoss + robust\_noisy perturbation |
+| Epochs (step 0) | 50 |
+| Epochs (IL steps) | 30 |
+| Augmentation | ColorJitter + synchronized horizontal flip (p=0.5) + pose dropout (p=0.1) |
 
-### IL Steps 2–14
+**IL loss (inherited from EfficientPIE):**
 
-Same optimizer / LR / schedule, but:
-- 30 epochs per step
-- IL loss: adaptive combination of `loss_new` and `loss_old`
-- Backbone frozen in `curr_model`; all other params train
-- `prev_model` fully frozen (eval mode, no grad)
+```
+loss_new = CrossEntropy(robust_noisy(pred_curr), labels)
+loss_old = KL_distillation(prev_pred.detach(), labels, temperature=2)
+loss = loss_new  if loss_new > loss_old  else  0.5 * loss_old + loss_new
+```
 
-### Perturbation (inherited from EfficientPIE)
+**Robust noisy perturbation:**
 
-`robust_noisy(logits, epoch, total_epochs)` applies progressive perturbation to logits:
-- Perturbation magnitude grows with epoch: `m_j = epoch / total_epochs`
-- Noise vector: `[p_j, -p_j]` where `p_j = rand(-m_j/E, m_j/E)`
+```
+m_j = epoch / total_epochs
+p_j = rand(-m_j, m_j)
+logits_perturbed = logits + [p_j, -p_j]
+```
 
 ---
 
 ## 6. Evaluation Protocol
 
-**Dataset split:** PIE random split (train/val/test), `seq_overlap_rate=0.5`.
+- PIE random split: 90/5/5 train/val/test
+- `max_size_observe=15`, `seq_overlap_rate=0.5`, balanced classes
+- Test set: 92 pedestrians, 893 samples
+- Metrics: Accuracy, AUC, F1, Precision (sklearn)
+- Best val accuracy checkpoint used for test evaluation
 
-**Metrics:**
-- Accuracy, AUC (sklearn `roc_auc_score`), F1, Precision
-- v=0 subset: same metrics on stationary pedestrians only
-
-**Checkpointing:** best validation accuracy checkpoint is used for final eval.
-
-**Reference (EfficientPIE, author weights):**
-
-| Metric | Value |
-|---|---|
-| Accuracy | 0.918 |
-| AUC | 0.917 |
-| F1 | 0.952 |
-| Precision | 0.961 |
-| Inference | 0.279 ms |
+**v=0 stationary subset:**
+```python
+delta = sqrt((cx_N - cx_0)^2 + (cy_N - cy_0)^2) / bbox_width
+stationary = (delta < 5.0)   # 871 / 893 test samples
+```
 
 ---
 
-## 7. Ablation Study Design
+## 7. Results Summary
 
-All ablations use the same IL training protocol. Only one component changes per ablation.
+### PIE Test Set
 
-| ID | Name | Change | Tests |
-|---|---|---|---|
-| A1 | No temporal comparison | f\* = f\_current (attention is no-op) | Does f\* selection contribute? |
-| A2 | f\* = frame 0 always | Fixed first frame, no distance selection | Does *which* f\* matters? |
-| A3 | Random f\* | f\* sampled uniformly from [0, step-1] | Is embedding distance better than random? |
-| A4 | No pose features | pose\_feats = zeros (B,34) | How much does body pose contribute? |
-| A5 | No cross-attention | Replace attn with identity; use only pose\_feats + embed\_current | How much does temporal attention contribute? |
-| A6 | ChangeDetector f\* | Replace cosine-distance f\* with `ChangeDetector.detect()` | Is embedding distance better than threshold-based detection? |
+| Model | Acc | AUC | F1 | Prec | Inference |
+|-------|-----|-----|----|------|-----------|
+| EfficientPIE (paper) | 0.920 | 0.917 | 0.952 | 0.960 | 0.21ms |
+| v4 best (step 2) | 0.919 | 0.922 | 0.953 | 0.958 | 1.19ms |
+| v4 step 14 | 0.913 | 0.915 | 0.949 | 0.953 | 1.19ms |
+| **v3 best (step 14)** | **0.926** | **0.947** | **0.957** | **0.957** | **1.81ms** |
 
-Run individual ablations by modifying `SparseDataset._select_fstar()` or
-`SparseTemporalPIE.forward()` and re-running `run_sparse_pie_pipeline.sh`.
+End-to-end (+ ViTPose-B, 3.875ms): v3 = 5.68ms, v4 = 5.07ms.
 
----
+### IL Step Progression (Test Accuracy)
 
-## 8. Expected Results & Baselines
+| IL Step | v3 | v4 |
+|---------|----|----|
+| 0 | 0.9048 | 0.9082 |
+| 2 | 0.9205 | 0.9194 |
+| 4 | 0.9071 | 0.9048 |
+| 6 | 0.9048 | 0.9059 |
+| 8 | 0.9037 | 0.8970 |
+| 10 | 0.9104 | 0.9037 |
+| 12 | 0.9127 | 0.9183 |
+| **14** | **0.9261** | 0.9127 |
 
-| Model | Acc | AUC | F1 | Prec | Notes |
-|---|---|---|---|---|---|
-| EfficientPIE (paper) | 0.92 | 0.92 | 0.95 | 0.96 | Table 3 |
-| EfficientPIE (replicated) | 0.918 | 0.917 | 0.952 | 0.961 | author weights |
-| SparseTemporalPIE | TBD | TBD | TBD | TBD | training in progress |
-| A1: no f\* comparison | TBD | — | — | — | |
-| A4: no pose\_feats | TBD | — | — | — | |
-
-Target: beat EfficientPIE replicated results. The pose features add direct body-config
-signal not available in the original; embedding-distance f\* provides a calibration-free
-temporal reference.
+v3 improves through the full IL chain. v4 peaks at step 2 and degrades by step 14.
 
 ---
 
-## 9. Key Implementation Notes
-
-### Backbone is frozen everywhere
-
-The backbone in `SparseTemporalPIE` has `requires_grad=False` on all parameters.
-`load_backbone_weights()` maps EfficientPIE state-dict keys by attribute name prefix
-to backbone Sequential indices (0=commonConv, 1=fm1, ..., 8=dropout).
-The classifier head keys in the EfficientPIE checkpoint are simply not mapped (missing
-in target → ignored by `strict=False`).
-
-### Backbone copy in SparseDataset
-
-`SparseDataset.__init__` deep-copies the backbone to CPU and sets it to eval mode.
-This is required because DataLoader workers are forked subprocesses — CUDA tensors
-are not safe to share across fork. The CPU copy is ~2.7 MB; with 8 workers the total
-overhead is ~22 MB (negligible).
-
-The encode\_transform used inside `_select_fstar` is deterministic (no augmentation),
-matching the val\_transform used at training time.
+## 8. Key Implementation Notes
 
 ### Keypoint path convention
 
 ```
-{keypoints_dir}/{pid}/{frame_id}.npy
+{keypoints_dir}/{pid}/{frame_id:05d}.npy
 ```
 
-`frame_id` is the zero-padded absolute frame number extracted from the image filename
-(e.g., image path `.../00123.png` → `frame_id = "00123"`). Using the window index
-(0–14) would cause collisions when the same pedestrian appears in multiple
-non-overlapping observation windows — different sequences would overwrite each other's
-keypoints. The absolute frame number is unique per (pid, frame).
+`frame_id` is the absolute frame number from the image filename (not the window index
+0–14). This prevents collisions when the same pedestrian appears in multiple
+non-overlapping observation windows.
 
-Extracted by `extract_keypoints.py` using ViTPose-B (`usyd-community/vitpose-base-coco-aic-mpii`).
-PIE dataset: 150,240 files, 100% hit rate (centroid within bbox ±20px).
+### Pose normalization
 
-### IL step and f* history
-
-At IL step N, the dataset uses frame at index N as f\_current. f\* is selected from
-frames [0, N-1]. As N increases (observation window grows), the model sees more
-temporal context and the embedding-distance f\* can pick a more diverse reference frame.
-
-Steps: 0 → 2 → 4 → 6 → 8 → 10 → 12 → 14 (even indices only, following EfficientPIE IDIL protocol).
-
-### Robust noisy perturbation
-
-Inherited from `utils/train_val.py:robust_noisy()`. Applies to logits before loss:
 ```python
-m_j = epoch / total_epochs
-p_j = random.uniform(-m_j / E, m_j / E)   # E = embedding_dim conceptually
-logits[:, 0] += p_j
-logits[:, 1] -= p_j
+feats[k*2]   = (x - bbox_x1) / bbox_width
+feats[k*2+1] = (y - bbox_y1) / bbox_height
+# joints with conf < 0.25 → zeroed
 ```
-Perturbation grows with epoch, acting as a curriculum that gradually increases
-difficulty during training.
 
-### Cross-attention with seq_len=1
+### Context frame selection (v3)
 
-`nn.MultiheadAttention` expects `(seq_len, batch, embed_dim)`. Both Q and K/V have
-seq\_len=1 (single embedding per image). The attention reduces to a learned linear
-transformation of embed\_fstar gated by similarity to embed\_current — effectively
-a soft selection of which aspects of f\* to bring into the enriched representation.
+```python
+indices = np.linspace(0, step-1, min(K=4, step), dtype=int)
+# step=0: [0] (single frame, mask=1, rest padded)
+# step=2: [0, 1]
+# step=6: [0, 2, 4, 5]
+# step=14: [0, 4, 9, 13]
+```
+
+### Backbone partial unfreeze
+
+During training, backbone parameters receive `lr × 0.1`. Head parameters receive full `lr`.
+This prevents catastrophic forgetting of the ImageNet-pretrained features while allowing
+fine-tuning for the pedestrian domain.
+
+### Val set size caveat
+
+The PIE val set contains only ~92 pedestrians (~500 samples after step filtering). This
+is too small to reliably rank model variants — v3 appeared to ceiling at 0.870 val while
+achieving 0.926 on test. Always report test set numbers; do not over-tune to val.

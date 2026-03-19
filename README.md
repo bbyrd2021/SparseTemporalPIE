@@ -1,69 +1,68 @@
 # SparseTemporalPIE
 
 > Fork of [EfficientPIE](https://github.com/heinideyibadiaole/EfficientPIE) (IJCAI-25)
-> Extended with embedding-distance keyframe selection and normalized pose features.
+> Extended with multi-frame cross-attention, pose velocity, and explicit motion/behavioral context.
 > Authors: Brandon Byrd, Abel Abebe Bzuayene — xDI Lab, NC A&T State University
 
 ---
 
 ## Overview
 
-**EfficientPIE** predicts pedestrian crossing intention from a single 300×300 image crop
-using an EfficientNet-inspired backbone (no RNN). It achieves state-of-the-art accuracy
-at 0.69M parameters and sub-millisecond inference.
+**EfficientPIE** predicts pedestrian crossing intention from a single image crop using an
+EfficientNet-inspired backbone with no temporal modeling. It achieves 0.92 accuracy at
+0.69M parameters and sub-millisecond inference.
 
-**SparseTemporalPIE** extends EfficientPIE with a temporal mechanism:
-- A salient reference frame (f\*) is selected from the observation window as the frame
-  with maximum cosine distance from f\_current in the frozen backbone embedding space
-- f\_current and f\* are encoded by a shared frozen EfficientPIE backbone
-- Cross-attention fuses the two embeddings (f\_current queries, f\* keys/values)
-- Normalized ViTPose keypoints for f\_current are concatenated to the classifier input,
-  providing explicit body-pose signal alongside the temporal attention context
+**SparseTemporalPIE** extends EfficientPIE with three additional information streams:
 
-Architecture:
+- **Pose features** — ViTPose-B keypoints (34-d static + 34-d velocity) fused into the backbone embedding
+- **Multi-frame cross-attention** — up to K=4 evenly-spaced context frames attend to the current frame
+- **Motion and behavioral context** — bbox trajectory statistics (12-d) + ego-vehicle speed, pedestrian action/look (5-d) via late-fusion MLP
+
+Two variants were trained and evaluated:
+
+| Variant | Architecture | Params | Inference | Best Accuracy | Best AUC |
+|---------|-------------|--------|-----------|---------------|----------|
+| **v3** | Cross-attention + pose velocity + ctx MLP | 9.0M | 1.81ms | **0.9261** | **0.9468** |
+| v4 | No attention, static pose + ctx MLP only | 1.1M | 1.19ms | 0.9194 | 0.9220 |
+| EfficientPIE (paper) | Single frame, visual only | 0.69M | 0.21ms | 0.920 | 0.917 |
+
+v3 establishes new state-of-the-art AUC on the PIE test set. End-to-end inference including
+upstream ViTPose-B pose estimation: v3 = 5.68ms, v4 = 5.07ms (both real-time at 30fps).
+
+See [`docs/RESULTS.md`](docs/RESULTS.md) for full SOTA comparison.
+
+---
+
+## Architecture (v3)
 
 ```
-                    ┌─ frozen backbone ──► embed_current (1280)
-f_current (300×300) ┤
-                    └─ (also for f* selection via cosine distance)
-
-f* = argmax cosine_distance(embed_current, embed_t) for t in [0, step-1]
-     (computed in SparseDataset using a CPU copy of the backbone)
-
-f*       (300×300) ──► frozen backbone ──► embed_fstar (1280)
-
-CrossAttention(Q=embed_current, K=embed_fstar, V=embed_fstar)
-    │
-    attn_out (1280)
-    │
-residual: embed_current + attn_out  → LayerNorm
-    │
-FeedForward: 1280 → 512 → 1280  → LayerNorm
-    │
-    enriched (1280)
-
-pose_feats (34) ← normalize_pose(keypoints[step], bbox)
-                  17 joints × (norm_x, norm_y); low-conf joints zeroed
-
-concat([enriched, pose_feats])  →  1314-d
-    │
-Classifier: Linear(1314→256) → ReLU → Dropout → Linear(256→2)
-    │
-crossing probability
+f_current ──► backbone ──► emb (1280-d) ◄── pose_proj(pose_current, 68-d)
+                                │
+f_context[0..K] ► backbone ► K context embs ◄── pose_proj(pose_context, K×68-d)
+                                │
+                      cross_attn(Q=emb, K/V=context, K=4)
+                                │
+                         attn_norm + FF(1280→512→1280) + ff_norm
+                                │  (enriched, 1280-d)
+bbox_traj (12-d) ──┐
+ctx_feats  (5-d) ──┴──► ctx_proj MLP ──► ctx (128-d)
+                                │
+                    classifier(1408 → 256 → 2)
 ```
 
 ---
 
-## Verified Results (PIE Test Set)
+## Results (PIE Test Set)
 
-| Metric    | SparseTemporalPIE | EfficientPIE (replicated) | Paper (Table 3) |
-|-----------|:-----------------:|:-------------------------:|:---------------:|
-| Accuracy  | TBD               | 0.918                     | 0.92            |
-| AUC       | TBD               | 0.917                     | 0.92            |
-| F1        | TBD               | 0.952                     | 0.95            |
-| Precision | TBD               | 0.961                     | 0.96            |
+| Metric    | EfficientPIE (paper) | v4 (ours) | v3 (ours) |
+|-----------|---------------------|-----------|-----------|
+| Accuracy  | 0.920               | 0.919     | **0.926** |
+| AUC       | 0.917               | 0.922     | **0.947** |
+| F1        | 0.952               | 0.953     | **0.957** |
+| Precision | 0.960               | 0.958     | **0.957** |
+| Inference | 0.21ms              | 1.19ms    | 1.81ms    |
 
-See [`docs/REPLICATION_RESULTS.md`](docs/REPLICATION_RESULTS.md) for full EfficientPIE details.
+See [`docs/RESULTS.md`](docs/RESULTS.md) for full SOTA comparison table with 14 methods.
 
 ---
 
@@ -71,32 +70,36 @@ See [`docs/REPLICATION_RESULTS.md`](docs/REPLICATION_RESULTS.md) for full Effici
 
 ```
 models/
-  EfficientPIE.py                 # baseline model (unchanged)
-  SparseTemporalPIE.py            # temporal cross-attention model
+  EfficientPIE.py                  # baseline model (unchanged)
+  SparseTemporalPIE.py             # v4: single frame + ctx MLP
+  SparseTemporalPIE_v3.py          # v3: multi-frame cross-attention (reconstructed for eval)
 
 utils/
-  pie_data.py / jaad_data.py      # dataset APIs
-  my_dataset.py                   # EfficientPIE dataset loader
-  sparse_dataset.py               # SparseTemporalPIE dataset (f_current, f*, pose_feats)
-  change_detector.py              # ViTPose ChangeDetector (retained for ablation)
-  train_val.py                    # training/eval loops (EfficientPIE + SparseTemporalPIE)
+  pie_data.py / jaad_data.py       # dataset APIs (pie_data.py modified for ctx features)
+  my_dataset.py                    # EfficientPIE dataset loader
+  sparse_dataset.py                # v4 dataset — 5-tuple (f_current, pose, bbox_traj, ctx, label)
+  sparse_dataset_v3.py             # v3 dataset — 8-tuple (+ f_context, context_mask, pose_context)
+  train_val.py                     # training/eval loops (EfficientPIE + SparseTemporalPIE)
 
-train_EfficientPIE.py             # EfficientPIE base training
-pie_domain_incremental_learning.py # IL steps 2→14
-test_EfficientPIE.py              # EfficientPIE evaluation
+train_EfficientPIE.py              # EfficientPIE base training
+pie_domain_incremental_learning.py # EfficientPIE IL steps 2→14
+test_EfficientPIE.py               # EfficientPIE evaluation
 
-train_SparseTemporalPIE.py        # SparseTemporalPIE base training (step 0)
-pie_sparse_incremental_learning.py # SparseTemporalPIE IL steps 2→14
-test_SparseTemporalPIE.py         # evaluation + v=0 subset metrics
+train_SparseTemporalPIE.py         # v4 base training (step 0, 50 epochs)
+pie_sparse_incremental_learning.py # v4 IL steps 2→14
+test_SparseTemporalPIE.py          # v4 evaluation + v=0 subset metrics
+test_SparseTemporalPIE_v3.py       # v3 evaluation + v=0 subset metrics
 
-extract_frames.py                 # video → image frames (run once)
-extract_keypoints.py              # ViTPose keypoint extraction (run once)
-calibrate_change_detector.py      # ablation tool — not used in main pipeline
+extract_frames.py                  # video → image frames (run once)
+extract_keypoints.py               # ViTPose-B keypoint extraction (run once)
 
-run_sparse_pie_pipeline.sh        # full SparseTemporalPIE pipeline
-run_pie_pipeline.sh               # full EfficientPIE pipeline
+weights_sparse_v3/                 # v3 IL checkpoints (steps 0–14)
+weights_sparse_v4/                 # v4 IL checkpoints (steps 0–14)
 
-docs/                             # design docs and session notes
+docs/
+  RESULTS.md                       # full results and SOTA comparison
+  SPARSE_TEMPORAL_PIE.md           # architecture and implementation guide
+  SESSION_NOTES_*.md               # development session logs
 ```
 
 ---
@@ -109,16 +112,14 @@ pip install -r requirements.txt
 
 **Dataset setup:**
 
-Annotations from [PedestrianIntent++](https://github.com/...):
 ```bash
+# Annotations (symlink from PedestrianIntent++)
 ln -s /path/to/PedestrianIntent++/PIE/PIE/annotations/annotations /data/datasets/PIE/annotations
 ln -s /path/to/PedestrianIntent++/PIE/PIE/annotations/annotations_attributes /data/datasets/PIE/annotations_attributes
 ln -s /path/to/PedestrianIntent++/PIE/PIE/annotations/annotations_vehicle /data/datasets/PIE/annotations_vehicle
 ln -s /path/to/PedestrianIntent++/JAAD/annotations /data/datasets/JAAD/annotations
-```
 
-PIE clip layout expected by the API:
-```bash
+# PIE clip layout
 mkdir /data/datasets/PIE/PIE_clips
 for i in 01 02 03 04 05 06; do
   ln -s /data/datasets/PIE/set$i /data/datasets/PIE/PIE_clips/set$i
@@ -129,50 +130,60 @@ done
 
 ## Usage
 
-### EfficientPIE
+### SparseTemporalPIE (v3 — best results)
 
 ```bash
-# 1. Extract frames (one-time)
-python extract_frames.py --dataset pie --data-path /data/datasets/PIE
-
-# 2. Base training
-python train_EfficientPIE.py --step 0 --epochs 50 --batch_size 32 \
-    --weights pre_train_weights/min_loss_pretrained_model_imagenet.pth
-
-# 3. Incremental learning (steps 2→14)
-python pie_domain_incremental_learning.py --step 2 --prev_weights weights_v8/best_model_PIE_step0.pth
-
-# 4. Evaluate
-python test_EfficientPIE.py --weights weights_v8/best_model_PIE_IL_step14_new.pth
-```
-
-### SparseTemporalPIE
-
-```bash
-# Prerequisites (one-time)
+# One-time setup
 python extract_frames.py --dataset pie --data-path /data/datasets/PIE
 python extract_keypoints.py --dataset pie --data-path /data/datasets/PIE \
     --output-dir /data/datasets/PIE/keypoints_pid
 
-# Full pipeline (step 0 + IL steps 2–14 + eval)
-bash run_sparse_pie_pipeline.sh
+# Base training (step 0)
+python train_SparseTemporalPIE.py \
+    --weights weights_v8/model_8_PIE_IL_step14_new.pth \
+    --output-dir weights_sparse_v4 --epochs 50 --device cuda:0
+
+# IL steps 2→14
+python pie_sparse_incremental_learning.py \
+    --weights weights_sparse_v4/best_sparse_step0.pth \
+    --output-dir weights_sparse_v4 --restart-period 7 --device cuda:0
+
+# Evaluate v3 (use weights_sparse_v3/ checkpoints)
+python test_SparseTemporalPIE_v3.py \
+    --weights weights_sparse_v3/best_sparse_step14.pth \
+    --step 14 --device cuda:0
+
+# Evaluate v4
+python test_SparseTemporalPIE.py \
+    --weights weights_sparse_v4/best_sparse_step2.pth \
+    --step 2 --device cuda:0
+```
+
+### EfficientPIE (baseline)
+
+```bash
+python train_EfficientPIE.py --step 0 --epochs 50 --batch_size 32 \
+    --weights pre_train_weights/min_loss_pretrained_model_imagenet.pth
+python pie_domain_incremental_learning.py --step 2 \
+    --prev_weights weights_v8/best_model_PIE_step0.pth
+python test_EfficientPIE.py --weights weights_v8/best_model_PIE_IL_step14_new.pth
 ```
 
 ---
 
 ## Documentation
 
-- [`docs/SPARSE_TEMPORAL_PIE.md`](docs/SPARSE_TEMPORAL_PIE.md) — full architecture and implementation guide
-- [`docs/REPLICATION_RESULTS.md`](docs/REPLICATION_RESULTS.md) — verified EfficientPIE replication metrics
-- [`docs/SESSION_NOTES_2026-03-10.md`](docs/SESSION_NOTES_2026-03-10.md) — EfficientPIE bug fixes and replication
-- [`docs/SESSION_NOTES_2026-03-10b.md`](docs/SESSION_NOTES_2026-03-10b.md) — SparseTemporalPIE initial design
-- [`docs/SESSION_NOTES_2026-03-11.md`](docs/SESSION_NOTES_2026-03-11.md) — keypoint extraction, calibration, architecture revision
+- [`docs/RESULTS.md`](docs/RESULTS.md) — full results, SOTA comparison, ablation, inference benchmarks
+- [`docs/SPARSE_TEMPORAL_PIE.md`](docs/SPARSE_TEMPORAL_PIE.md) — architecture and implementation guide
+- [`docs/REPLICATION_RESULTS.md`](docs/REPLICATION_RESULTS.md) — EfficientPIE replication metrics
+- [`docs/SESSION_NOTES_2026-03-18.md`](docs/SESSION_NOTES_2026-03-18.md) — v3/v4 design decisions
+- [`docs/SESSION_NOTES_2026-03-19.md`](docs/SESSION_NOTES_2026-03-19.md) — final test results
 
 ---
 
 ## Citation
 
-If you use this work, please also cite the original EfficientPIE paper:
+If you use this work, please cite the original EfficientPIE paper:
 
 ```bibtex
 @inproceedings{efficientpie2025,
