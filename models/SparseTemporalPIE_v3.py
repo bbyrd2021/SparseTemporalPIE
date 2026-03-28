@@ -116,3 +116,33 @@ class SparseTemporalPIE_v3(nn.Module):
 
         # 5. Classify
         return self.classifier(torch.cat([enriched, ctx], dim=-1))
+
+
+def load_backbone_weights(model, weights_path, device='cuda:0'):
+    """Load EfficientPIE or ImageNet pretrained weights into the v3 backbone."""
+    checkpoint = torch.load(weights_path, map_location=device)
+    src = checkpoint.get('model', checkpoint)
+
+    key_map = {
+        'commonConv':  '0',
+        'fm1':         '1',
+        'fm2':         '2',
+        'mb1':         '3',
+        'mb2':         '4',
+        'commonConv1': '5',
+    }
+
+    target = {}
+    for src_key, src_val in src.items():
+        for name, idx in key_map.items():
+            if src_key.startswith(name + '.'):
+                new_key = 'backbone.' + idx + src_key[len(name):]
+                target[new_key] = src_val
+                break
+
+    missing, unexpected = model.load_state_dict(target, strict=False)
+    loaded = len(target) - len(unexpected)
+    print(f"Backbone weights loaded: {loaded}/{len(src)} keys")
+    if missing:
+        print(f"  Missing (new layers, expected): {len(missing)} keys")
+    return model

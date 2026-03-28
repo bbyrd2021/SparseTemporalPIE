@@ -354,6 +354,117 @@ def incremental_learning_train_sparse(model, optimizer, dataloader, device, epoc
     return accu_loss.item() / (step + 1), accuracy.item(), precision.item(), recall.item(), f1_score.item()
 
 
+@torch.no_grad()
+def evaluate_sparse_v3(model, dataloader, device, epoch):
+    """Evaluation loop for SparseTemporalPIE v3 (7-input forward pass)."""
+    model.eval()
+    loss_function = torch.nn.CrossEntropyLoss()
+    accu_loss = torch.zeros(1).to(device)
+
+    TP = torch.zeros(1).to(device)
+    TN = torch.zeros(1).to(device)
+    FP = torch.zeros(1).to(device)
+    FN = torch.zeros(1).to(device)
+    preds_all  = []
+    labels_all = []
+
+    dataloader = tqdm(dataloader, file=sys.stdout)
+    for step, data in enumerate(dataloader):
+        f_current, f_context, context_mask, pose_current, pose_context, bbox_traj, ctx_feats, labels = data
+        pred = model(f_current.to(device), f_context.to(device), context_mask.to(device),
+                     pose_current.to(device), pose_context.to(device),
+                     bbox_traj.to(device), ctx_feats.to(device))
+
+        pred_classes = torch.max(pred, dim=1)[1]
+        labels = labels.to(device)
+        TP += ((pred_classes == 1) & (labels == 1)).sum().float()
+        TN += ((pred_classes == 0) & (labels == 0)).sum().float()
+        FP += ((pred_classes == 1) & (labels == 0)).sum().float()
+        FN += ((pred_classes == 0) & (labels == 1)).sum().float()
+
+        loss = loss_function(pred, labels)
+        accu_loss += loss
+
+        accuracy  = (TP + TN) / (TP + TN + FP + FN)
+        precision = TP / (TP + FP)
+        recall    = TP / (TP + FN)
+        f1_score  = 2 * ((precision * recall) / (precision + recall))
+
+        preds_all.extend(pred[:, 1].cpu().numpy())
+        labels_all.extend(labels.cpu())
+        auc_score = roc_auc_score(labels_all, preds_all)
+
+        dataloader.desc = "[valid epoch {}] loss: {:.3f}, acc: {:.3f}, precision: {:.3f}, " \
+                          "recall: {:.3f}, f1_score: {:.3f}, auc: {:.3f}" \
+            .format(epoch, accu_loss.item() / (step + 1), accuracy.item(), precision.item(),
+                    recall.item(), f1_score.item(), auc_score)
+
+    return accu_loss.item() / (step + 1), accuracy.item(), precision.item(), recall.item(), f1_score.item()
+
+
+def incremental_learning_train_sparse_v3(model, optimizer, dataloader, device, epoch, prev_model, total_epochs=30):
+    """IL training loop for SparseTemporalPIE v3."""
+    model.train()
+    prev_model.eval()
+    for p in prev_model.parameters():
+        p.requires_grad = False
+
+    accu_loss = torch.zeros(1).to(device)
+    TP = torch.zeros(1).to(device)
+    TN = torch.zeros(1).to(device)
+    FP = torch.zeros(1).to(device)
+    FN = torch.zeros(1).to(device)
+
+    optimizer.zero_grad()
+    dataloader = tqdm(dataloader, file=sys.stdout)
+    for step, data in enumerate(dataloader):
+        f_current, f_context, context_mask, pose_current, pose_context, bbox_traj, ctx_feats, labels = data
+        f_current    = f_current.to(device)
+        f_context    = f_context.to(device)
+        context_mask = context_mask.to(device)
+        pose_current = pose_current.to(device)
+        pose_context = pose_context.to(device)
+        bbox_traj    = bbox_traj.to(device)
+        ctx_feats    = ctx_feats.to(device)
+        labels       = labels.to(device)
+
+        pred         = model(f_current, f_context, context_mask, pose_current, pose_context, bbox_traj, ctx_feats)
+        robust_pred  = robust_noisy(pred, epoch, total_epochs)
+        pred_classes = torch.max(pred, dim=1)[1]
+
+        TP += ((pred_classes == 1) & (labels == 1)).sum().float()
+        TN += ((pred_classes == 0) & (labels == 0)).sum().float()
+        FP += ((pred_classes == 1) & (labels == 0)).sum().float()
+        FN += ((pred_classes == 0) & (labels == 1)).sum().float()
+
+        loss_new = torch.nn.CrossEntropyLoss()(robust_pred, labels)
+        with torch.no_grad():
+            prev_pred = prev_model(f_current, f_context, context_mask, pose_current, pose_context, bbox_traj, ctx_feats)
+        loss_old = loss_old_func(prev_pred.detach(), labels)
+
+        loss = loss_new if loss_new > loss_old else 0.5 * loss_old + loss_new
+        loss.backward()
+        accu_loss += loss.detach()
+
+        accuracy  = (TP + TN) / (TP + TN + FP + FN)
+        precision = TP / (TP + FP)
+        recall    = TP / (TP + FN)
+        f1_score  = 2 * ((precision * recall) / (precision + recall))
+        dataloader.desc = "[train epoch {}] loss: {:.3f}, acc: {:.3f}, precision: {:.3f}, " \
+                          "recall: {:.3f}, f1_score: {:.3f}" \
+            .format(epoch, accu_loss.item() / (step + 1), accuracy.item(), precision.item(),
+                    recall.item(), f1_score.item())
+
+        if not torch.isfinite(loss):
+            print('WARNING: non-finite loss, ending training ', loss)
+            sys.exit(1)
+
+        optimizer.step()
+        optimizer.zero_grad()
+
+    return accu_loss.item() / (step + 1), accuracy.item(), precision.item(), recall.item(), f1_score.item()
+
+
 def loss_old_func(prev_pred, labels, temperature=2):
     labels = F.one_hot(labels, num_classes=prev_pred.size(1)).float()  # one-hot encode labels
     prev_pred = F.softmax(prev_pred, dim=-1)
