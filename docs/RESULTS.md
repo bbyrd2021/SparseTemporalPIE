@@ -54,6 +54,21 @@ SparseTemporalPIE extends EfficientPIE with three new information streams fused 
 
 **Temporal context frames.** Up to $K=4$ context frames are selected at evenly-spaced indices from $[0, t-1]$, where $t$ is the current IL step. Each context frame is passed through the shared backbone, augmented with its own pose embedding, and used as keys and values in a multi-head cross-attention layer with the current frame embedding as the query.
 
+The IL chain progressively expands the temporal window available to the model — at step 2 there is barely any context; at step 14 the context spans the full observation window:
+
+| IL Step | `f_current` | Context indices (K≤4, evenly spaced) |
+|---------|-------------|--------------------------------------|
+| 0       | frame 0     | [0] (padded)                         |
+| 2       | frame 2     | [0, 1]                               |
+| 4       | frame 4     | [0, 1, 2, 3]                         |
+| 6       | frame 6     | [0, 2, 4, 5]                         |
+| 8       | frame 8     | [0, 2, 5, 7]                         |
+| 10      | frame 10    | [0, 3, 6, 9]                         |
+| 12      | frame 12    | [0, 3, 7, 11]                        |
+| 14      | frame 14    | [0, 4, 9, 13]                        |
+
+Cross-attention runs once per forward pass: Q = `f_current` embedding, K/V = the K context embeddings. Each IL step trains a new model distilled from the previous step, so later steps inherit prior knowledge while gaining access to a wider temporal span. This is why v3 continues improving through step 14 — the attention head extracts new discriminative signal as the window grows — while v4 (no attention) has no mechanism to exploit the additional context and stagnates after step 2.
+
 **Motion and behavioral features.** Bounding box trajectory statistics (12-d: displacement, velocity, acceleration, size ratio over $[0, t]$) and ego-vehicle context features (5-d: OBD speed at $t$, mean speed over $[0, t]$, speed validity flag, pedestrian action, pedestrian look direction) are projected via a 2-layer MLP to a 128-d context vector and concatenated with the enriched embedding at the classifier (late fusion).
 
 ```
