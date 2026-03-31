@@ -22,14 +22,14 @@ Two variants were trained and evaluated:
 
 | Variant | Architecture | Params | Inference | Best Accuracy | Best AUC |
 |---------|-------------|--------|-----------|---------------|----------|
-| **v3** | Cross-attention + pose velocity + ctx MLP | 9.0M | 1.81ms | **0.9261** | **0.9468** |
-| v4 | No attention, static pose + ctx MLP only | 1.1M | 1.19ms | 0.9194 | 0.9220 |
+| **v3** | Cross-attention + pose velocity + ctx MLP | 9.0M | 2.50ms | **0.9261** | **0.9468** |
+| v4 | No attention, static pose + ctx MLP only | 1.1M | 0.46ms | 0.9194 | 0.9220 |
 | EfficientPIE (paper) | Single frame, visual only | 0.69M | 0.21ms | 0.920 | 0.917 |
 
-v3 establishes new state-of-the-art AUC on the PIE test set. End-to-end inference including
-upstream ViTPose-B pose estimation: v3 = 5.68ms, v4 = 5.07ms (both real-time at 30fps).
+Inference measured at batch=128, 50-run warm-up, 100 timed CUDA event runs.
+End-to-end including upstream ViTPose-B pose estimation (3.875ms): v3 = 6.38ms, v4 = 4.34ms — both real-time at 30fps.
 
-See [`docs/RESULTS.md`](docs/RESULTS.md) for full SOTA comparison.
+See [`docs/RESULTS.md`](docs/RESULTS.md) for full SOTA comparison and JAAD results.
 
 ---
 
@@ -50,19 +50,36 @@ ctx_feats  (5-d) ──┴──► ctx_proj MLP ──► ctx (128-d)
                     classifier(1408 → 256 → 2)
 ```
 
+Context frames are selected as `np.linspace(0, step-1, min(K=4, step))` at each IL step,
+so the temporal window expands from 1 frame at step 0 to the full 15-frame sequence at step 14.
+
 ---
 
-## Results (PIE Test Set)
+## Results
+
+### PIE Test Set
 
 | Metric    | EfficientPIE (paper) | v4 (ours) | v3 (ours) |
 |-----------|---------------------|-----------|-----------|
 | Accuracy  | 0.920               | 0.919     | **0.926** |
 | AUC       | 0.917               | 0.922     | **0.947** |
 | F1        | 0.952               | 0.953     | **0.957** |
-| Precision | 0.960               | 0.958     | **0.957** |
-| Inference | 0.21ms              | 1.19ms    | 1.81ms    |
+| Precision | 0.960               | 0.958     | 0.957     |
+| Inference | 0.21ms              | 0.46ms    | 2.50ms    |
 
-See [`docs/RESULTS.md`](docs/RESULTS.md) for full SOTA comparison table with 14 methods.
+### JAAD Test Set
+
+| Metric    | EfficientPIE (paper) | v3 (ours) |
+|-----------|---------------------|-----------|
+| Accuracy  | **0.890**           | 0.878     |
+| AUC       | 0.860               | **0.885** |
+| F1        | 0.620               | **0.633** |
+| Precision | **0.630**           | 0.597     |
+
+v3 consistently improves AUC across both datasets (+0.030 PIE, +0.025 JAAD), producing
+better-calibrated risk scores for safety-critical downstream planners.
+
+See [`docs/RESULTS.md`](docs/RESULTS.md) for full SOTA comparison table, ablation study, and IL step progression.
 
 ---
 
@@ -94,21 +111,29 @@ scripts/
     jaad_domain_incremental_learning.py  # JAAD IL steps 2→14
     test_EfficientPIE_JAAD.py            # JAAD evaluation
   sparsetemporalpie/
-    train_SparseTemporalPIE.py           # v4 base training (step 0)
-    pie_sparse_incremental_learning.py   # v4 IL steps 2→14
-    test_SparseTemporalPIE.py            # v4 evaluation + v=0 subset
-    test_SparseTemporalPIE_v3.py         # v3 evaluation + v=0 subset
+    train_SparseTemporalPIE.py           # v4 PIE base training (step 0)
+    pie_sparse_incremental_learning.py   # v4 PIE IL steps 2→14
+    train_SparseTemporalPIE_v3.py        # v3 PIE base training (step 0)
+    pie_sparse_incremental_learning_v3.py # v3 PIE IL steps 2→14
+    train_SparseTemporalPIE_v3_jaad.py   # v3 JAAD base training (step 0)
+    jaad_sparse_incremental_learning_v3.py # v3 JAAD IL steps 2→14
+    test_SparseTemporalPIE.py            # v4 evaluation (PIE + JAAD)
+    test_SparseTemporalPIE_v3.py         # v3 PIE evaluation
+    test_SparseTemporalPIE_v3_jaad.py    # v3 JAAD evaluation
+    benchmark_inference.py              # latency benchmark (batch=128, CUDA events)
   ablation/
-    calibrate_change_detector.py         # ChangeDetector ablation tool
+    calibrate_change_detector.py        # ChangeDetector ablation tool
 
 pipelines/
   run_pie_pipeline.sh                    # full EfficientPIE PIE pipeline
   run_jaad_pipeline.sh                   # full EfficientPIE JAAD pipeline
-  run_sparse_pie_pipeline.sh             # full SparseTemporalPIE pipeline
+  run_sparse_pie_pipeline.sh             # full SparseTemporalPIE v4 PIE pipeline
+  run_sparse_v3_imagenet_pipeline.sh     # v3 PIE pipeline (ImageNet backbone)
   run_training_after_extraction.sh       # wait for extraction then train
 
-weights_sparse_v3/                       # v3 IL checkpoints (steps 0–14)
-weights_sparse_v4/                       # v4 IL checkpoints (steps 0–14)
+weights_sparse_v3/                       # v3 PIE IL checkpoints (steps 0–14)
+weights_sparse_v3_jaad/                  # v3 JAAD IL checkpoints (steps 0–14)
+weights_sparse_v4/                       # v4 PIE IL checkpoints (steps 0–14)
 
 docs/
   RESULTS.md                             # full results and SOTA comparison
@@ -116,7 +141,7 @@ docs/
   SESSION_NOTES_*.md                     # development session logs
 ```
 
-> All scripts are run from the repo root, e.g. `python scripts/sparsetemporalpie/train_SparseTemporalPIE.py`
+> All scripts are run from the repo root, e.g. `python scripts/sparsetemporalpie/train_SparseTemporalPIE_v3.py`
 
 ---
 
@@ -126,14 +151,13 @@ docs/
 pip install -r requirements.txt
 ```
 
-**Dataset setup:**
+**Dataset setup (PIE):**
 
 ```bash
-# Annotations (symlink from PedestrianIntent++)
+# Annotations
 ln -s /path/to/PedestrianIntent++/PIE/PIE/annotations/annotations /data/datasets/PIE/annotations
 ln -s /path/to/PedestrianIntent++/PIE/PIE/annotations/annotations_attributes /data/datasets/PIE/annotations_attributes
 ln -s /path/to/PedestrianIntent++/PIE/PIE/annotations/annotations_vehicle /data/datasets/PIE/annotations_vehicle
-ln -s /path/to/PedestrianIntent++/JAAD/annotations /data/datasets/JAAD/annotations
 
 # PIE clip layout
 mkdir /data/datasets/PIE/PIE_clips
@@ -142,11 +166,22 @@ for i in 01 02 03 04 05 06; do
 done
 ```
 
+**Dataset setup (JAAD):**
+
+```bash
+ln -s /path/to/PedestrianIntent++/JAAD/annotations /data/datasets/JAAD/annotations
+ln -s /path/to/PedestrianIntent++/JAAD/annotations_attributes /data/datasets/JAAD/annotations_attributes
+ln -s /path/to/PedestrianIntent++/JAAD/annotations_appearance /data/datasets/JAAD/annotations_appearance
+ln -s /path/to/PedestrianIntent++/JAAD/annotations_traffic /data/datasets/JAAD/annotations_traffic
+ln -s /path/to/PedestrianIntent++/JAAD/annotations_vehicle /data/datasets/JAAD/annotations_vehicle
+ln -s /path/to/PedestrianIntent++/JAAD/split_ids /data/datasets/JAAD/split_ids
+```
+
 ---
 
 ## Usage
 
-### SparseTemporalPIE (v3 — best results)
+### SparseTemporalPIE v3 — PIE
 
 ```bash
 # One-time setup
@@ -155,27 +190,52 @@ python scripts/preprocess/extract_keypoints.py --dataset pie --data-path /data/d
     --output-dir /data/datasets/PIE/keypoints_pid
 
 # Base training (step 0)
-python scripts/sparsetemporalpie/train_SparseTemporalPIE.py \
+python scripts/sparsetemporalpie/train_SparseTemporalPIE_v3.py \
     --weights weights_v8/model_8_PIE_IL_step14_new.pth \
-    --output-dir weights_sparse_v4 --epochs 50 --device cuda:0
+    --output-dir weights_sparse_v3 --epochs 50 --device cuda:0
 
 # IL steps 2→14
-python scripts/sparsetemporalpie/pie_sparse_incremental_learning.py \
-    --weights weights_sparse_v4/best_sparse_step0.pth \
-    --output-dir weights_sparse_v4 --restart-period 7 --device cuda:0
+python scripts/sparsetemporalpie/pie_sparse_incremental_learning_v3.py \
+    --weights weights_sparse_v3/best_sparse_v3_step0.pth \
+    --output-dir weights_sparse_v3 --device cuda:0
 
-# Evaluate v3
+# Evaluate
 python scripts/sparsetemporalpie/test_SparseTemporalPIE_v3.py \
     --weights weights_sparse_v3/best_sparse_step14.pth \
     --step 14 --device cuda:0
+```
 
-# Evaluate v4
-python scripts/sparsetemporalpie/test_SparseTemporalPIE.py \
-    --weights weights_sparse_v4/best_sparse_step2.pth \
-    --step 2 --device cuda:0
+### SparseTemporalPIE v3 — JAAD
 
-# Or run the full pipeline
-bash pipelines/run_sparse_pie_pipeline.sh
+```bash
+# One-time setup
+python scripts/preprocess/extract_frames.py --dataset jaad --data-path /data/datasets/JAAD
+python scripts/preprocess/extract_keypoints.py --dataset jaad --data-path /data/datasets/JAAD \
+    --output-dir /data/datasets/JAAD/keypoints_pid
+
+# Base training (step 0)
+python scripts/sparsetemporalpie/train_SparseTemporalPIE_v3_jaad.py \
+    --weights weights_v8/model_8_PIE_IL_step14_new.pth \
+    --output-dir weights_sparse_v3_jaad --epochs 50 --device cuda:0
+
+# IL steps 2→14
+python scripts/sparsetemporalpie/jaad_sparse_incremental_learning_v3.py \
+    --weights weights_sparse_v3_jaad/best_sparse_v3_jaad_step0.pth \
+    --output-dir weights_sparse_v3_jaad --device cuda:0
+
+# Evaluate
+python scripts/sparsetemporalpie/test_SparseTemporalPIE_v3_jaad.py \
+    --weights weights_sparse_v3_jaad/best_sparse_v3_jaad_step14.pth \
+    --step 14 --device cuda:0
+```
+
+### Inference Benchmark
+
+```bash
+python scripts/sparsetemporalpie/benchmark_inference.py \
+    --weights-v3 weights_sparse_v3/best_sparse_step14.pth \
+    --weights-v4 weights_sparse_v4/best_sparse_step2.pth \
+    --batch-size 128 --warmup 50 --runs 100 --device cuda:0
 ```
 
 ### EfficientPIE (baseline)
@@ -193,11 +253,11 @@ python scripts/efficientpie/test_EfficientPIE.py \
 
 ## Documentation
 
-- [`docs/RESULTS.md`](docs/RESULTS.md) — full results, SOTA comparison, ablation, inference benchmarks
+- [`docs/RESULTS.md`](docs/RESULTS.md) — full results, SOTA comparison (PIE + JAAD), ablation, inference benchmarks
 - [`docs/SPARSE_TEMPORAL_PIE.md`](docs/SPARSE_TEMPORAL_PIE.md) — architecture and implementation guide
 - [`docs/REPLICATION_RESULTS.md`](docs/REPLICATION_RESULTS.md) — EfficientPIE replication metrics
-- [`docs/SESSION_NOTES_2026-03-18.md`](docs/SESSION_NOTES_2026-03-18.md) — v3/v4 design decisions
-- [`docs/SESSION_NOTES_2026-03-19.md`](docs/SESSION_NOTES_2026-03-19.md) — final test results
+- [`docs/SESSION_NOTES_2026-03-26.md`](docs/SESSION_NOTES_2026-03-26.md) — backbone ablation, JAAD setup
+- [`docs/SESSION_NOTES_2026-03-27.md`](docs/SESSION_NOTES_2026-03-27.md) — JAAD training results, full eval
 
 ---
 
