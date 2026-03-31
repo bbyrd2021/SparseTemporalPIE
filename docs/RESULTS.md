@@ -95,7 +95,7 @@ ctx_feats  (5-d) ──┴──► ctx_proj MLP ──► ctx (128-d)
 
 ### 3.1 Comparison with State of the Art (PIE Test Set)
 
-Inference times from EfficientPIE Table 3 (RTX 3090, batch=128, 100 runs). Our models benchmarked on same protocol. End-to-end times include upstream ViTPose-B pose estimation (3.875ms).
+Inference times measured on same protocol as EfficientPIE (batch=128, 50-run warm-up, 100 timed runs, CUDA events). EfficientPIE paper time is from Table 3 (RTX 3090). End-to-end (†) adds upstream ViTPose-B pose estimation (3.875ms).
 
 | Method                          | Year | Accuracy | AUC   | F1    | Precision | Inference     |
 |---------------------------------|------|----------|-------|-------|-----------|---------------|
@@ -112,10 +112,10 @@ Inference times from EfficientPIE Table 3 (RTX 3090, batch=128, 100 runs). Our m
 | GTransPDM                       | 2024 | 0.920    | 0.870 | —     | —         | —             |
 | EfficientPIE [paper]            | 2025 | 0.920    | 0.917 | 0.952 | 0.960     | 0.21ms        |
 | EfficientPIE [replicated]       | 2025 | 0.918    | 0.917 | 0.952 | 0.961     | 1.05ms        |
-| SparseTemporalPIE v4 (ours)     | 2026 | 0.919    | 0.922 | 0.953 | 0.958     | 1.19ms        |
-| SparseTemporalPIE v4 e2e (ours) | 2026 | 0.919    | 0.922 | 0.953 | 0.958     | 5.07ms †      |
-| **SparseTemporalPIE v3 (ours)** | **2026** | **0.926** | **0.947** | **0.957** | **0.957** | **1.81ms** |
-| SparseTemporalPIE v3 e2e (ours) | 2026 | 0.926    | 0.947 | 0.957 | 0.957     | 5.68ms †      |
+| SparseTemporalPIE v4 (ours)     | 2026 | 0.919    | 0.922 | 0.953 | 0.958     | 0.46ms        |
+| SparseTemporalPIE v4 e2e (ours) | 2026 | 0.919    | 0.922 | 0.953 | 0.958     | 4.34ms †      |
+| **SparseTemporalPIE v3 (ours)** | **2026** | **0.926** | **0.947** | **0.957** | **0.957** | **2.50ms** |
+| SparseTemporalPIE v3 e2e (ours) | 2026 | 0.926    | 0.947 | 0.957 | 0.957     | 6.38ms †      |
 
 † End-to-end includes upstream ViTPose-B pose estimation (3.875ms, 90M params). In a production AV stack, pose estimation runs as part of the perception pipeline and may be shared across tasks.
 
