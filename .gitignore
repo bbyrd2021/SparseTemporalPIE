@@ -7,8 +7,7 @@ weights_sparse/
 
 # Training artifacts
 runs/
-training_logs/
-training_logs_sparse/
+training_logs*/
 
 # Python
 __pycache__/
