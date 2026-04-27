@@ -35,20 +35,7 @@ See [`docs/RESULTS.md`](docs/RESULTS.md) for full SOTA comparison and JAAD resul
 
 ## Architecture (v3)
 
-```
-f_current ──► backbone ──► emb (1280-d) ◄── pose_proj(pose_current, 68-d)
-                                │
-f_context[0..K] ► backbone ► K context embs ◄── pose_proj(pose_context, K×68-d)
-                                │
-                      cross_attn(Q=emb, K/V=context, K=4)
-                                │
-                         attn_norm + FF(1280→512→1280) + ff_norm
-                                │  (enriched, 1280-d)
-bbox_traj (12-d) ──┐
-ctx_feats  (5-d) ──┴──► ctx_proj MLP ──► ctx (128-d)
-                                │
-                    classifier(1408 → 256 → 2)
-```
+![SparseTemporalPIE v3 architecture](docs/sparse_temporal_pie_architecture.svg)
 
 Context frames are selected as `np.linspace(0, step-1, min(K=4, step))` at each IL step,
 so the temporal window expands from 1 frame at step 0 to the full 15-frame sequence at step 14.
